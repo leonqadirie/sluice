@@ -1,0 +1,52 @@
+# yaml-language-server: $schema=https://taskfile.dev/schema.json
+
+version: '3'
+
+tasks:
+  default:
+    desc: Run the tests, the linter, and the format check
+    cmds:
+      - task: verify
+
+  deps:
+    desc: Download the dependencies
+    cmds:
+      - gleam deps download
+
+  check:
+    desc: Show an error for each compiler warning
+    cmds:
+      - gleam build --warnings-as-errors
+
+  test:
+    desc: Run the tests
+    cmds:
+      - gleam test
+
+  lint:
+    desc: Run the linter
+    cmds:
+      - gleam run -m glinter
+
+  format:
+    desc: Format the source code and the tests
+    cmds:
+      - gleam format src test
+
+  format-check:
+    desc: Show an error if the code format is not correct
+    cmds:
+      - gleam format --check src test
+
+  docs:
+    desc: Build the HTML documentation
+    cmds:
+      - gleam docs build
+
+  verify:
+    desc: Run the tests, the linter, the format check, and the warning check
+    cmds:
+      - task: check
+      - task: test
+      - task: lint
+      - task: format-check
