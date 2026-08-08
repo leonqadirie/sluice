@@ -2,6 +2,7 @@
 
 import gleam/erlang/process
 import gleam/int
+import gleam/list
 import gleam/yielder
 import sluice
 import sluice/sink
@@ -76,6 +77,66 @@ pub fn emit_final_delivers_and_stops_test() {
     process.selector_receive(down_selector, 2000)
 
   support.shutdown(collector)
+}
+
+// A source whose events end in the middle of a demand cannot wait for
+// the next ask: after a batch that does not fill the demand, the
+// consumer does not ask again. The source must end with `emit_final` in
+// the same call. The full sequence arrives, and the Permanent sink
+// follows the stop of the source.
+pub fn emit_final_ends_a_partial_final_batch_test() {
+  let batch_probe = process.new_subject()
+  let total = 8
+  let assert Ok(finite) =
+    source.new(init: 0, on_demand: fn(emitted, demand) {
+      let remaining = total - emitted
+      case remaining <= demand {
+        True -> source.emit_final(support.count_up(emitted, remaining))
+        False ->
+          source.emit(support.count_up(emitted, demand), emitted + demand)
+      }
+    })
+    |> source.start()
+  let assert Ok(collector) =
+    sink.new(init: Nil, on_events: fn(state, events, _subscription) {
+      process.send(batch_probe, events)
+      sink.continue(state)
+    })
+    |> sink.start()
+  let sink_monitor = process.monitor(collector.pid)
+  process.unlink(collector.pid)
+  process.unlink(finite.pid)
+
+  let assert Ok(_) =
+    sluice.subscription(to: finite.data)
+    |> sluice.min_demand(2)
+    |> sluice.max_demand(6)
+    |> sluice.subscribe(consumer: collector.data)
+
+  // The first demand of 6 is filled completely. The final two events do
+  // not fill the second demand, and they arrive nevertheless.
+  assert collect_batches(batch_probe, total, []) == support.count_up(0, total)
+
+  // The source stopped, and the Permanent sink follows.
+  let down_selector =
+    process.new_selector()
+    |> process.select_specific_monitor(sink_monitor, fn(down) { down })
+  let assert Ok(process.ProcessDown(_, _, process.Normal)) =
+    process.selector_receive(down_selector, 2000)
+}
+
+fn collect_batches(
+  batch_probe: process.Subject(List(Int)),
+  quantity: Int,
+  collected: List(Int),
+) -> List(Int) {
+  case list.length(collected) >= quantity {
+    True -> collected
+    False -> {
+      let assert Ok(events) = process.receive(batch_probe, 1000)
+      collect_batches(batch_probe, quantity, list.append(collected, events))
+    }
+  }
 }
 
 pub fn fold_returns_the_final_value_test() {
