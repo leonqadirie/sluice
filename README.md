@@ -39,6 +39,18 @@ You don't need sluice for a one-off parallel computation over data you
 already have in memory; spawning ordinary processes is simpler. Reach for
 sluice when the stages are long-lived processes and the data never stops.
 
+## What sluice does not do
+
+- Sluice does not store events. Events live in mailboxes and buffers,
+  and they are lost when a stage stops or a full buffer drops them. Keep
+  a durable copy outside the pipeline if you need one.
+- Sluice does not deliver events a second time. When a consumer crashes,
+  the events on their way to it are lost. If every event must be
+  handled, feed the pipeline from a source that can replay, such as a
+  job queue or an event store.
+- Sluice does not spread work across machines. A pipeline runs on one
+  BEAM node, using as many processes on that node as you give it.
+
 ## How do stages connect?
 
 Every connection runs from an **outlet** to an **inlet**. An outlet is
