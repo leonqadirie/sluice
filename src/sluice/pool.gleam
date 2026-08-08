@@ -28,6 +28,10 @@ pub opaque type State {
 /// same time, and each worker runs `run` for one event. The result is a
 /// normal sink builder: give it a name or start it directly, and
 /// subscribe it with the `Manual` demand mode.
+///
+/// * `concurrency`: The maximum quantity of parallel workers for each
+///   subscription.
+/// * `run`: The function that one worker runs for one event.
 pub fn sink(
   concurrency concurrency: Int,
   run run: fn(event) -> Nil,

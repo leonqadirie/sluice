@@ -33,6 +33,10 @@ pub fn broadcast() -> Dispatcher(event) {
 /// partition with `sluice.partition`. Events for a partition without open
 /// demand wait in a queue for that partition. Thus a slow partition does
 /// not stop the other partitions.
+///
+/// * `count`: The quantity of partitions.
+/// * `by`: The function that gives one event its partition, from 0 to
+///   `count` - 1.
 pub fn partition(
   count count: Int,
   by by: fn(event) -> Int,

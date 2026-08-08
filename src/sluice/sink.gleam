@@ -23,6 +23,9 @@ pub opaque type Next(state) {
   StopAbnormal(reason: String)
 }
 
+/// Continue with the new state.
+///
+/// * `state`: The new state of the sink.
 pub fn continue(state: state) -> Next(state) {
   Continue(state)
 }
@@ -33,6 +36,9 @@ pub fn stop() -> Next(state) {
   Stop
 }
 
+/// Stop the sink with a failure reason.
+///
+/// * `reason`: The description of the failure.
 pub fn stop_abnormal(reason: String) -> Next(state) {
   StopAbnormal(reason)
 }
@@ -53,6 +59,11 @@ pub type FoldError {
 /// value when the producer stops. Use it together with `from_yielder` or
 /// an other source that has an end. The wait has a limit of `within`
 /// milliseconds.
+///
+/// * `outlet`: The outlet that supplies the events.
+/// * `initial`: The first value of the accumulator.
+/// * `combine`: The function that folds one event into the accumulator.
+/// * `timeout`: The maximum wait time in milliseconds.
 pub fn fold(
   from outlet: sluice.Outlet(event),
   initial initial: accumulated,
@@ -114,17 +125,25 @@ pub opaque type Name(event) {
   Name(name: process.Name(sluice.ConsumerControl(event)))
 }
 
+/// Make a permanent name. Create names during application start, not
+/// inside a dynamic loop.
+///
+/// * `prefix`: The readable prefix of the name.
 pub fn new_name(prefix prefix: String) -> Name(event) {
   Name(process.new_name(prefix))
 }
 
 /// The process that has this name now, if a process has it.
+///
+/// * `name`: The name of the sink.
 pub fn whereis(name: Name(event)) -> Result(process.Pid, Nil) {
   process.named(name.name)
 }
 
 /// The inlet of the sink that has this name. The inlet stays correct
 /// through restarts.
+///
+/// * `name`: The name of the sink.
 pub fn inlet_of(name: Name(event)) -> Inlet(event) {
   sluice.make_inlet(
     fn(control) { platform.send_named(name.name, control) },
@@ -147,6 +166,10 @@ pub opaque type Builder(state, event) {
 
 /// Define a sink. The handler receives each batch of events and the
 /// subscription that supplied the batch.
+///
+/// * `state`: The first state of the sink.
+/// * `on_events`: The batch handler. It receives the state, one batch of
+///   events, and the subscription that supplied the batch.
 pub fn new(
   init state: state,
   on_events on_events: fn(state, List(event), Subscription) -> Next(state),
@@ -171,6 +194,9 @@ pub fn new(
 /// for example a missing partition, comes later as an abnormal end of
 /// the subscription. Use this together with `outlet_of` names for
 /// connections that continue through restarts.
+///
+/// * `builder`: The builder to change.
+/// * `options`: The subscription options, from `sluice.subscription`.
 pub fn subscribe(
   builder builder: Builder(state, event),
   options options: SubscriptionOptions(event),
@@ -181,6 +207,10 @@ pub fn subscribe(
 /// Set a hook that runs when the sink establishes a subscription. The
 /// hook receives the new `Subscription`, so a sink with manual demand can
 /// make its first ask here.
+///
+/// * `builder`: The builder to change.
+/// * `on_subscribed`: The hook. It receives the state and the new
+///   `Subscription`.
 pub fn on_subscribed(
   builder: Builder(state, event),
   on_subscribed: fn(state, Subscription) -> Next(state),
@@ -191,6 +221,10 @@ pub fn on_subscribed(
 /// Set a hook that runs when a subscription of the sink ends. When this
 /// hook is set, it decides what the sink does, and the cancel mode of the
 /// subscription does not apply.
+///
+/// * `builder`: The builder to change.
+/// * `on_cancelled`: The hook. It receives the state and the
+///   `SubscriptionEnd` that gives the cause.
 pub fn on_cancelled(
   builder: Builder(state, event),
   on_cancelled: fn(state, sluice.SubscriptionEnd) -> Next(state),
@@ -203,6 +237,12 @@ pub fn on_cancelled(
 /// to other processes, or start a timer with `process.send_after`. The
 /// handler receives each message together with the state. Use this for
 /// timers, for configuration changes, and for queries.
+///
+/// * `builder`: The builder to change.
+/// * `initialise`: The function that receives the subject of the channel
+///   at the start of the sink.
+/// * `handler`: The message handler. It receives the state and one
+///   message, and it returns a `Next`.
 pub fn on_message(
   builder: Builder(state, event),
   initialise initialise: fn(Subject(user_message)) -> Nil,
@@ -223,6 +263,9 @@ pub fn on_message(
 
 /// The maximum time for the start of the sink, which includes its
 /// declared subscriptions. The default is 5000 milliseconds.
+///
+/// * `builder`: The builder to change.
+/// * `milliseconds`: The maximum start time in milliseconds.
 pub fn start_timeout(
   builder builder: Builder(state, event),
   milliseconds milliseconds: Int,
@@ -231,6 +274,9 @@ pub fn start_timeout(
 }
 
 /// Attach a permanent name to the sink at its start.
+///
+/// * `builder`: The builder to change.
+/// * `name`: The name, from `new_name`.
 pub fn named(
   builder builder: Builder(state, event),
   name name: Name(event),
@@ -262,6 +308,8 @@ type State(state, event) {
 
 /// Start the sink. The returned data is its `Inlet`. You can subscribe it
 /// to outlets.
+///
+/// * `builder`: The configuration of the sink.
 pub fn start(
   builder: Builder(state, event),
 ) -> Result(actor.Started(Inlet(event)), actor.StartError) {

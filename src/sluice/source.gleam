@@ -35,6 +35,9 @@ pub opaque type Produce(state, event) {
 /// Emit less than the demand only when such later events can come:
 /// without them, the consumers wait for the open demand and do not ask
 /// again. A source that ends must end with `emit_final`.
+///
+/// * `events`: The events to emit.
+/// * `state`: The new state of the source.
 pub fn emit(
   events events: List(event),
   state state: state,
@@ -46,6 +49,8 @@ pub fn emit(
 /// reason. Use this when the source ends in the middle of a demand: the
 /// events go out first, and then the subscribers apply their cancel
 /// modes.
+///
+/// * `events`: The last events of the source.
 pub fn emit_final(events: List(event)) -> Produce(state, event) {
   EmitFinal(events)
 }
@@ -63,6 +68,8 @@ pub fn stop() -> Produce(state, event) {
 }
 
 /// Stop the source with a failure reason.
+///
+/// * `reason`: The description of the failure.
 pub fn stop_abnormal(reason: String) -> Produce(state, event) {
   StopAbnormal(reason)
 }
@@ -81,6 +88,9 @@ type EmitterMessage(event) {
 /// Push events into the source. The source sends them to the consumers
 /// immediately, up to the open demand. The buffer keeps the remaining
 /// events.
+///
+/// * `emitter`: The `Emitter` of the source.
+/// * `events`: The events to push.
 pub fn push(
   through emitter: Emitter(event),
   events events: List(event),
@@ -89,6 +99,8 @@ pub fn push(
 }
 
 /// Stop the source with the normal reason, from a different process.
+///
+/// * `emitter`: The `Emitter` of the source.
 pub fn finish(emitter: Emitter(event)) -> Nil {
   process.send(emitter.subject, Finished)
 }
@@ -100,11 +112,17 @@ pub opaque type Name(event) {
   Name(name: process.Name(ProducerMessage(event)))
 }
 
+/// Make a permanent name. Create names during application start, not
+/// inside a dynamic loop.
+///
+/// * `prefix`: The readable prefix of the name.
 pub fn new_name(prefix prefix: String) -> Name(event) {
   Name(process.new_name(prefix))
 }
 
 /// The process that has this name now, if a process has it.
+///
+/// * `name`: The name of the source.
 pub fn whereis(name: Name(event)) -> Result(process.Pid, Nil) {
   process.named(name.name)
 }
@@ -112,6 +130,8 @@ pub fn whereis(name: Name(event)) -> Result(process.Pid, Nil) {
 /// The outlet of the source that has this name. The outlet stays correct
 /// through restarts of the source. Thus use it to connect stages under a
 /// supervisor.
+///
+/// * `name`: The name of the source.
 pub fn outlet_of(name: Name(event)) -> Outlet(event) {
   // While a stage restarts, its name can be free for a short time.
   // Messages that you send in this time are lost. This is the same as
@@ -170,6 +190,10 @@ fn default_builder(
 }
 
 /// Define a source that makes events on demand.
+///
+/// * `state`: The first state of the source.
+/// * `on_demand`: The demand handler. It receives the state and the open
+///   demand, and it returns a `Produce` with the new events.
 pub fn new(
   init state: state,
   on_demand on_demand: fn(state, Int) -> Produce(state, event),
@@ -182,6 +206,9 @@ pub fn new(
 /// through the `Emitter`. A source that only receives pushes can keep the
 /// default `on_demand`. If the source can also make events on request, set
 /// a handler with `on_demand`.
+///
+/// * `initialise`: The initialiser. It receives the `Emitter` of the
+///   source, and it returns the first state.
 pub fn new_with_emitter(
   init initialise: fn(Emitter(event)) -> Result(state, String),
 ) -> Builder(state, event) {
@@ -191,6 +218,8 @@ pub fn new_with_emitter(
 /// Define a source that takes its events from a yielder. The source
 /// steps the yielder as far as the demand asks. It stops with the normal
 /// reason at the end of the yielder.
+///
+/// * `yielder`: The yielder that supplies the events.
 pub fn from_yielder(
   yielder yielder: Yielder(event),
 ) -> Builder(Yielder(event), event) {
@@ -220,6 +249,10 @@ fn step_yielder(
 }
 
 /// Set the demand handler of a source that `new_with_emitter` made.
+///
+/// * `builder`: The builder to change.
+/// * `on_demand`: The demand handler. It receives the state and the open
+///   demand, and it returns a `Produce` with the new events.
 pub fn on_demand(
   builder: Builder(state, event),
   on_demand: fn(state, Int) -> Produce(state, event),
@@ -229,6 +262,9 @@ pub fn on_demand(
 
 /// Set the maximum quantity of events that the buffer keeps while there is
 /// no demand. The default is 10,000.
+///
+/// * `builder`: The builder to change.
+/// * `capacity`: The maximum quantity of events in the buffer.
 pub fn buffer_capacity(
   builder builder: Builder(state, event),
   events capacity: Int,
@@ -237,6 +273,8 @@ pub fn buffer_capacity(
 }
 
 /// Remove the buffer limit.
+///
+/// * `builder`: The builder to change.
 pub fn buffer_unbounded(
   builder: Builder(state, event),
 ) -> Builder(state, event) {
@@ -245,6 +283,9 @@ pub fn buffer_unbounded(
 
 /// Select the events that stay when the buffer is full. The default is
 /// `KeepLast`.
+///
+/// * `builder`: The builder to change.
+/// * `keep`: The `Keep` selection.
 pub fn buffer_keep(
   builder builder: Builder(state, event),
   keep keep: Keep,
@@ -256,6 +297,8 @@ pub fn buffer_keep(
 /// the source makes no events. A call of `sluice.forward_demand` on the
 /// outlet releases the held asks. Use this to connect a full pipeline
 /// before the events start to move.
+///
+/// * `builder`: The builder to change.
 pub fn accumulate_demand(
   builder: Builder(state, event),
 ) -> Builder(state, event) {
@@ -265,6 +308,10 @@ pub fn accumulate_demand(
 /// Set a hook that runs when a subscriber arrives or leaves. Use it, for
 /// example, to start work at the first subscriber and to stop work at the
 /// last one.
+///
+/// * `builder`: The builder to change.
+/// * `on_subscribers`: The hook. It receives the state and the
+///   `SubscriberChange`, and it returns the new state.
 pub fn on_subscribers(
   builder: Builder(state, event),
   on_subscribers: fn(state, sluice.SubscriberChange) -> state,
@@ -274,6 +321,9 @@ pub fn on_subscribers(
 
 /// Set the dispatcher of the source. The default is the demand
 /// dispatcher.
+///
+/// * `builder`: The builder to change.
+/// * `dispatcher`: The dispatcher of the source.
 pub fn dispatcher(
   builder builder: Builder(state, event),
   dispatcher dispatcher: Dispatcher(event),
@@ -287,6 +337,12 @@ pub fn dispatcher(
 /// handler receives each message together with the state, and it can emit
 /// events, like the demand handler. Use this for timers, for configuration
 /// changes, and for queries.
+///
+/// * `builder`: The builder to change.
+/// * `initialise`: The function that receives the subject of the channel
+///   at the start of the source.
+/// * `handler`: The message handler. It receives the state and one
+///   message, and it returns a `Produce`.
 pub fn on_message(
   builder: Builder(state, event),
   initialise initialise: fn(Subject(user_message)) -> Nil,
@@ -308,6 +364,10 @@ pub fn on_message(
 /// Set the response of the source to discarded events. The callback
 /// receives the state and the quantity of discarded events. The default
 /// response writes a warning to the log.
+///
+/// * `builder`: The builder to change.
+/// * `on_discard`: The callback. It receives the state and the quantity
+///   of discarded events, and it returns the new state.
 pub fn on_discard(
   builder: Builder(state, event),
   on_discard: fn(state, Int) -> state,
@@ -317,6 +377,9 @@ pub fn on_discard(
 
 /// The maximum time for the start of the source. The default is 5000
 /// milliseconds.
+///
+/// * `builder`: The builder to change.
+/// * `milliseconds`: The maximum start time in milliseconds.
 pub fn start_timeout(
   builder builder: Builder(state, event),
   milliseconds milliseconds: Int,
@@ -325,6 +388,9 @@ pub fn start_timeout(
 }
 
 /// Attach a permanent name to the source at its start.
+///
+/// * `builder`: The builder to change.
+/// * `name`: The name, from `new_name`.
 pub fn named(
   builder builder: Builder(state, event),
   name name: Name(event),
@@ -354,6 +420,8 @@ type State(state, event) {
 
 /// Start the source. The returned data is its `Outlet`. You can subscribe
 /// to it.
+///
+/// * `builder`: The configuration of the source.
 pub fn start(
   builder: Builder(state, event),
 ) -> Result(actor.Started(Outlet(event)), actor.StartError) {
