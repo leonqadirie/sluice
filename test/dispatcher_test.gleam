@@ -42,7 +42,8 @@ pub fn no_demand_everything_is_leftover_test() {
 pub fn dispatch_caps_at_recorded_demand_test() {
   let consumer = subscriber()
   let demand_dispatcher = dispatcher.demand() |> subscribed(consumer)
-  let #(delta, demand_dispatcher) = demand_dispatcher.ask(2, consumer)
+  let #(delta, _deliveries, demand_dispatcher) =
+    demand_dispatcher.ask(2, consumer)
   assert delta == 2
   let result = demand_dispatcher.dispatch([1, 2, 3, 4], 4)
   assert result.deliveries == [Delivery(consumer, [1, 2])]
@@ -53,7 +54,7 @@ pub fn dispatch_caps_at_recorded_demand_test() {
 pub fn demand_carries_over_between_dispatches_test() {
   let consumer = subscriber()
   let demand_dispatcher = dispatcher.demand() |> subscribed(consumer)
-  let #(_, demand_dispatcher) = demand_dispatcher.ask(5, consumer)
+  let #(_, _deliveries, demand_dispatcher) = demand_dispatcher.ask(5, consumer)
   let result = demand_dispatcher.dispatch([1, 2], 2)
   assert result.deliveries == [Delivery(consumer, [1, 2])]
   assert result.next.total_demand() == 3
@@ -67,8 +68,8 @@ pub fn events_go_to_greatest_demand_first_test() {
   let modest = subscriber()
   let demand_dispatcher =
     dispatcher.demand() |> subscribed(hungry) |> subscribed(modest)
-  let #(_, demand_dispatcher) = demand_dispatcher.ask(10, hungry)
-  let #(_, demand_dispatcher) = demand_dispatcher.ask(2, modest)
+  let #(_, _deliveries, demand_dispatcher) = demand_dispatcher.ask(10, hungry)
+  let #(_, _deliveries, demand_dispatcher) = demand_dispatcher.ask(2, modest)
   // There are 5 events. All are in the demand of 10 from `hungry`.
   let result = demand_dispatcher.dispatch([1, 2, 3, 4, 5], 5)
   assert result.deliveries == [Delivery(hungry, [1, 2, 3, 4, 5])]
@@ -80,8 +81,8 @@ pub fn overflow_spills_to_next_subscriber_test() {
   let second = subscriber()
   let demand_dispatcher =
     dispatcher.demand() |> subscribed(first) |> subscribed(second)
-  let #(_, demand_dispatcher) = demand_dispatcher.ask(3, first)
-  let #(_, demand_dispatcher) = demand_dispatcher.ask(3, second)
+  let #(_, _deliveries, demand_dispatcher) = demand_dispatcher.ask(3, first)
+  let #(_, _deliveries, demand_dispatcher) = demand_dispatcher.ask(3, second)
   let result = demand_dispatcher.dispatch([1, 2, 3, 4, 5], 5)
   let total_delivered =
     list.fold(result.deliveries, 0, fn(sum, delivery) {
@@ -97,7 +98,8 @@ pub fn cancel_reports_zero_revoked_and_absorbs_future_asks_test() {
   let stayer = subscriber()
   let demand_dispatcher =
     dispatcher.demand() |> subscribed(leaver) |> subscribed(stayer)
-  let #(delta, demand_dispatcher) = demand_dispatcher.ask(4, leaver)
+  let #(delta, _deliveries, demand_dispatcher) =
+    demand_dispatcher.ask(4, leaver)
   assert delta == 4
   let #(revoked, demand_dispatcher) = demand_dispatcher.cancel(leaver)
   // The stage received an ask for 4 events before. The dispatcher does
@@ -106,16 +108,18 @@ pub fn cancel_reports_zero_revoked_and_absorbs_future_asks_test() {
   // make too many events.
   assert revoked == 0
   assert demand_dispatcher.total_demand() == 0
-  let #(delta, demand_dispatcher) = demand_dispatcher.ask(3, stayer)
+  let #(delta, _deliveries, demand_dispatcher) =
+    demand_dispatcher.ask(3, stayer)
   assert delta == 0
-  let #(delta, _) = demand_dispatcher.ask(3, stayer)
+  let #(delta, _, _) = demand_dispatcher.ask(3, stayer)
   assert delta == 2
 }
 
 pub fn ask_from_unknown_subscriber_is_ignored_test() {
   let stranger = subscriber()
   let demand_dispatcher = dispatcher.demand()
-  let #(delta, demand_dispatcher) = demand_dispatcher.ask(5, stranger)
+  let #(delta, _deliveries, demand_dispatcher) =
+    demand_dispatcher.ask(5, stranger)
   assert delta == 0
   assert demand_dispatcher.total_demand() == 0
 }
@@ -125,8 +129,8 @@ pub fn dispatch_preserves_event_order_across_subscribers_test() {
   let second = subscriber()
   let demand_dispatcher =
     dispatcher.demand() |> subscribed(first) |> subscribed(second)
-  let #(_, demand_dispatcher) = demand_dispatcher.ask(2, first)
-  let #(_, demand_dispatcher) = demand_dispatcher.ask(2, second)
+  let #(_, _deliveries, demand_dispatcher) = demand_dispatcher.ask(2, first)
+  let #(_, _deliveries, demand_dispatcher) = demand_dispatcher.ask(2, second)
   let result = demand_dispatcher.dispatch([1, 2, 3, 4], 4)
   let all_events =
     list.flat_map(result.deliveries, fn(delivery) { delivery.events })

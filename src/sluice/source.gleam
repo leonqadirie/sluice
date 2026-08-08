@@ -8,8 +8,8 @@ import gleam/int
 import gleam/option.{type Option, None, Some}
 import gleam/otp/actor
 import sluice.{type Keep, type Outlet}
+import sluice/dispatcher.{type Dispatcher}
 import sluice/internal/buffer
-import sluice/internal/dispatcher
 import sluice/internal/platform
 import sluice/internal/producer_core
 import sluice/internal/protocol.{type ConsumerMessage, type ProducerMessage}
@@ -111,6 +111,7 @@ pub opaque type Builder(state, event) {
     start_timeout: Int,
     on_discard: fn(state, Int) -> state,
     messages: Option(fn() -> Selector(Message(state, event))),
+    dispatcher: Dispatcher(event),
   )
 }
 
@@ -138,6 +139,7 @@ pub fn new(
     start_timeout: 5000,
     on_discard: default_on_discard,
     messages: None,
+    dispatcher: dispatcher.demand(),
   )
 }
 
@@ -158,6 +160,7 @@ pub fn new_with_emitter(
     start_timeout: 5000,
     on_discard: default_on_discard,
     messages: None,
+    dispatcher: dispatcher.demand(),
   )
 }
 
@@ -192,6 +195,15 @@ pub fn buffer_keep(
   keep keep: Keep,
 ) -> Builder(state, event) {
   Builder(..builder, keep:)
+}
+
+/// Set the dispatcher of the source. The default is the demand
+/// dispatcher.
+pub fn dispatcher(
+  builder builder: Builder(state, event),
+  dispatcher dispatcher: Dispatcher(event),
+) -> Builder(state, event) {
+  Builder(..builder, dispatcher:)
 }
 
 /// Give the source a private message channel with a type of your choice.
@@ -318,7 +330,7 @@ fn initialise(
         Ok(user_state) -> {
           let core =
             producer_core.new(
-              dispatcher.demand(),
+              dispatcher.build(builder.dispatcher),
               buffer.new(builder.capacity, builder.keep),
             )
           actor.initialised(State(
@@ -374,28 +386,10 @@ fn handle_message(
         True -> produce(state, unfilled)
       }
     }
-    FromDownstream(protocol.Cancel(from)) -> {
-      let producer_core.CancelResult(core:, selector:, outbound:) =
-        producer_core.on_cancel(
-          state.core,
-          state.selector,
-          from,
-          acknowledge: True,
-        )
-      producer_core.send_all(outbound)
-      continue_with(State(..state, core:, selector:))
-    }
-    SubscriberDown(from, _down) -> {
-      let producer_core.CancelResult(core:, selector:, outbound:) =
-        producer_core.on_cancel(
-          state.core,
-          state.selector,
-          from,
-          acknowledge: False,
-        )
-      producer_core.send_all(outbound)
-      continue_with(State(..state, core:, selector:))
-    }
+    FromDownstream(protocol.Cancel(from)) ->
+      subscriber_gone(state:, from:, acknowledge: True)
+    SubscriberDown(from, _down) ->
+      subscriber_gone(state:, from:, acknowledge: False)
     FromEmitter(Pushed(events)) -> {
       let producer_core.EmitResult(core:, outbound:, discarded:) =
         producer_core.emit(state.core, events)
@@ -430,6 +424,23 @@ fn apply_produce(
     }
     Stop -> actor.stop()
     StopAbnormal(reason) -> actor.stop_abnormal(reason)
+  }
+}
+
+// A removal can release demand (a broadcast dispatcher moves at the speed
+// of its slowest subscriber). Make new events for the released demand.
+fn subscriber_gone(
+  state state: State(state, event),
+  from from: Subject(ConsumerMessage(event)),
+  acknowledge acknowledge: Bool,
+) -> actor.Next(State(state, event), Message(state, event)) {
+  let producer_core.CancelResult(core:, selector:, outbound:, freed:) =
+    producer_core.on_cancel(state.core, state.selector, from, acknowledge:)
+  producer_core.send_all(outbound)
+  let state = State(..state, core:, selector:)
+  case freed > 0 {
+    False -> continue_with(state)
+    True -> produce(state, freed) |> actor.with_selector(selector)
   }
 }
 

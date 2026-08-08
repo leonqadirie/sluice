@@ -10,6 +10,7 @@
 
 import gleam/erlang/process.{type Pid, type Subject}
 import gleam/int
+import gleam/option.{Some}
 import sluice/internal/protocol.{
   type ConsumerMessage, type ProducerHandle, type SubscribeMetadata,
 }
@@ -151,6 +152,38 @@ pub fn cancel_mode(
   cancel cancel: CancelMode,
 ) -> SubscriptionOptions(event) {
   SubscriptionOptions(..options, cancel:)
+}
+
+/// Select the partition of this subscription. Only a producer with a
+/// partition dispatcher reads this value. Such a producer refuses a
+/// subscription without a partition.
+pub fn partition(
+  options options: SubscriptionOptions(event),
+  index index: Int,
+) -> SubscriptionOptions(event) {
+  SubscriptionOptions(
+    ..options,
+    metadata: protocol.SubscribeMetadata(
+      ..options.metadata,
+      partition: Some(index),
+    ),
+  )
+}
+
+/// Give the subscription an event filter. Only a producer with a
+/// broadcast dispatcher reads this value: the subscriber receives only
+/// the events for which `keep` returns `True`.
+pub fn selector(
+  options options: SubscriptionOptions(event),
+  keep keep: fn(event) -> Bool,
+) -> SubscriptionOptions(event) {
+  SubscriptionOptions(
+    ..options,
+    metadata: protocol.SubscribeMetadata(
+      ..options.metadata,
+      selector: Some(keep),
+    ),
+  )
 }
 
 /// Set how the subscription requests events. The default is `Automatic`.

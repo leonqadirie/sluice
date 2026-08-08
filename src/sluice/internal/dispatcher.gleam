@@ -22,6 +22,10 @@ pub type DispatchResult(event) {
   DispatchResult(
     deliveries: List(Delivery(event)),
     leftover: List(event),
+    /// Replacement asks for events that a subscriber filter removed. The
+    /// stage runtime replays them through the normal ask path, so the
+    /// replacement demand can start new production.
+    reask: List(#(Subject(ConsumerMessage(event)), Int)),
     next: Dispatcher(event),
   )
 }
@@ -31,9 +35,12 @@ pub type Dispatcher(event) {
     subscribe: fn(Subject(ConsumerMessage(event)), SubscribeMetadata(event)) ->
       Result(Dispatcher(event), String),
     /// Record the demand from a subscriber. Return the part of the demand
-    /// that is new demand on the stage.
-    ask: fn(Int, Subject(ConsumerMessage(event))) -> #(Int, Dispatcher(event)),
-    /// Remove a subscriber. Return the demand that the stage removes.
+    /// that is new demand on the stage, together with the deliveries that
+    /// this ask releases (for example from an internal partition queue).
+    ask: fn(Int, Subject(ConsumerMessage(event))) ->
+      #(Int, List(Delivery(event)), Dispatcher(event)),
+    /// Remove a subscriber. Return the demand that becomes available for
+    /// the other subscribers because of the removal.
     cancel: fn(Subject(ConsumerMessage(event))) -> #(Int, Dispatcher(event)),
     /// Give events to the subscribers that have recorded demand. The
     /// events that no subscriber has demand for come back as `leftover`.
@@ -96,7 +103,7 @@ fn make_demand(state: DemandState(event)) -> Dispatcher(event) {
         // Discard an ask from an unknown subscriber. This can occur when
         // the ask and the cancellation of one subscriber cross. The stage
         // does not stop.
-        False -> #(0, make_demand(state))
+        False -> #(0, [], make_demand(state))
         True -> {
           let absorbed = int.min(demand, state.pending)
           let demands =
@@ -105,7 +112,7 @@ fn make_demand(state: DemandState(event)) -> Dispatcher(event) {
             make_demand(
               DemandState(..state, demands:, pending: state.pending - absorbed),
             )
-          #(demand - absorbed, next)
+          #(demand - absorbed, [], next)
         }
       }
     },
@@ -128,6 +135,7 @@ fn make_demand(state: DemandState(event)) -> Dispatcher(event) {
       DispatchResult(
         deliveries:,
         leftover:,
+        reask: [],
         next: make_demand(DemandState(..state, demands:)),
       )
     },

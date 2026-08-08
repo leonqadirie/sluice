@@ -14,9 +14,9 @@ import sluice.{
   type Inlet, type Keep, type Outlet, type Subscription,
   type SubscriptionOptions,
 }
+import sluice/dispatcher.{type Dispatcher}
 import sluice/internal/buffer
 import sluice/internal/consumer_core
-import sluice/internal/dispatcher
 import sluice/internal/exit_reason
 import sluice/internal/platform
 import sluice/internal/producer_core
@@ -124,6 +124,7 @@ pub opaque type Builder(state, in, out) {
     start_timeout: Int,
     on_discard: fn(state, Int) -> state,
     messages: Option(fn() -> Selector(Message(state, in, out))),
+    dispatcher: Dispatcher(out),
   )
 }
 
@@ -144,6 +145,7 @@ pub fn new(
     start_timeout: 5000,
     on_discard: default_on_discard,
     messages: None,
+    dispatcher: dispatcher.demand(),
   )
 }
 
@@ -165,6 +167,14 @@ pub fn on_discard(
   on_discard: fn(state, Int) -> state,
 ) -> Builder(state, in, out) {
   Builder(..builder, on_discard:)
+}
+
+/// Set the dispatcher of the gate. The default is the demand dispatcher.
+pub fn dispatcher(
+  builder builder: Builder(state, in, out),
+  dispatcher dispatcher: Dispatcher(out),
+) -> Builder(state, in, out) {
+  Builder(..builder, dispatcher:)
 }
 
 /// Give the gate a private message channel with a type of your choice.
@@ -334,7 +344,7 @@ fn initialise(
           user_state: builder.state,
           consumer: consumer_core.new(),
           producer: producer_core.new(
-            dispatcher.demand(),
+            dispatcher.build(builder.dispatcher),
             buffer.new(builder.capacity, builder.keep),
           ),
           selector:,
@@ -496,28 +506,10 @@ fn handle_message(
       }
       actor.continue(State(..state, producer:, consumer:))
     }
-    FromDownstream(protocol.Cancel(from)) -> {
-      let producer_core.CancelResult(core: producer, selector:, outbound:) =
-        producer_core.on_cancel(
-          state.producer,
-          state.selector,
-          from,
-          acknowledge: True,
-        )
-      producer_core.send_all(outbound)
-      continue_with(State(..state, producer:, selector:))
-    }
-    SubscriberDown(from, _down) -> {
-      let producer_core.CancelResult(core: producer, selector:, outbound:) =
-        producer_core.on_cancel(
-          state.producer,
-          state.selector,
-          from,
-          acknowledge: False,
-        )
-      producer_core.send_all(outbound)
-      continue_with(State(..state, producer:, selector:))
-    }
+    FromDownstream(protocol.Cancel(from)) ->
+      subscriber_gone(state:, from:, acknowledge: True)
+    SubscriberDown(from, _down) ->
+      subscriber_gone(state:, from:, acknowledge: False)
     FromUser(apply) ->
       case apply(state.user_state) {
         Emit(produced, user_state) -> {
@@ -597,6 +589,27 @@ fn upstream_closed(
     consumer_core.StopNormal -> actor.stop()
     consumer_core.StopAbnormal(reason) -> actor.stop_abnormal(reason)
   }
+}
+
+// A removal can release demand (a broadcast dispatcher moves at the speed
+// of its slowest subscriber). Released demand is new appetite: the held
+// upstream asks can move again.
+fn subscriber_gone(
+  state state: State(state, in, out),
+  from from: Subject(ConsumerMessage(out)),
+  acknowledge acknowledge: Bool,
+) -> actor.Next(State(state, in, out), Message(state, in, out)) {
+  let producer_core.CancelResult(core: producer, selector:, outbound:, ..) =
+    producer_core.on_cancel(state.producer, state.selector, from, acknowledge:)
+  producer_core.send_all(outbound)
+  let appetite =
+    producer_core.has_demand(producer)
+    || producer_core.buffer_is_empty(producer)
+  let consumer = case appetite {
+    True -> consumer_core.flush_held_asks(state.consumer)
+    False -> state.consumer
+  }
+  continue_with(State(..state, producer:, selector:, consumer:))
 }
 
 fn continue_with(

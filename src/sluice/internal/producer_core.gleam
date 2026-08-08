@@ -45,12 +45,14 @@ pub type EmitResult(event) {
 }
 
 /// The result of `on_cancel`: the next core, the selector without the
-/// monitor of the subscriber, and the messages for the subscribers.
+/// monitor of the subscriber, the messages for the subscribers, and the
+/// demand that the removal frees for the other subscribers.
 pub type CancelResult(event, message) {
   CancelResult(
     core: Core(event),
     selector: Selector(message),
     outbound: List(Outbound(event)),
+    freed: Int,
   )
 }
 
@@ -134,10 +136,11 @@ pub fn on_ask(
   from from: Subject(ConsumerMessage(event)),
   demand demand: Int,
 ) -> #(Core(event), List(Outbound(event)), Int) {
-  let #(new_demand, next_dispatcher) = core.dispatcher.ask(demand, from)
+  let #(new_demand, deliveries, next_dispatcher) =
+    core.dispatcher.ask(demand, from)
   let core = Core(..core, dispatcher: next_dispatcher)
   let buffered_before = buffer.size(core.buffer)
-  let #(core, chunks) = drain(core, [])
+  let #(core, chunks) = drain(core, [from_deliveries(deliveries)])
   let taken = buffered_before - buffer.size(core.buffer)
   #(core, assemble(chunks), int.max(new_demand - taken, 0))
 }
@@ -208,7 +211,11 @@ fn drain(
 
 /// Remove a subscriber. Use `acknowledge: True` when the subscriber asked
 /// for the cancellation: the outbound messages then contain the
-/// acknowledgment. Use `acknowledge: False` when its process stopped.
+/// acknowledgment. Use `acknowledge: False` when its process stopped. The
+/// `freed` value is demand that the removal releases for the other
+/// subscribers (a broadcast dispatcher moves at the speed of its slowest
+/// subscriber, so a removal can release demand). The stage can make new
+/// events for it.
 pub fn on_cancel(
   core core: Core(event),
   selector selector: Selector(message),
@@ -223,21 +230,26 @@ pub fn on_cancel(
         core:,
         selector:,
         outbound: acknowledgement(from, acknowledge),
+        freed: 0,
       )
     Ok(monitor) -> {
       process.demonitor_process(monitor)
       let selector = process.deselect_specific_monitor(selector, monitor)
-      let #(_revoked, next_dispatcher) = core.dispatcher.cancel(from)
+      let #(freed, next_dispatcher) = core.dispatcher.cancel(from)
       let core =
         Core(
           ..core,
           dispatcher: next_dispatcher,
           subscribers: dict.delete(core.subscribers, from),
         )
+      let buffered_before = buffer.size(core.buffer)
+      let #(core, chunks) = drain(core, [acknowledgement(from, acknowledge)])
+      let taken = buffered_before - buffer.size(core.buffer)
       CancelResult(
         core:,
         selector:,
-        outbound: acknowledgement(from, acknowledge),
+        outbound: assemble(chunks),
+        freed: int.max(freed - taken, 0),
       )
     }
   }

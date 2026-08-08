@@ -147,6 +147,36 @@ let assert Ok(measurements) =
 The source sends pushed events to the consumers immediately, up to the open
 demand. The buffer keeps the remaining events.
 
+## Dispatchers
+
+A dispatcher decides which subscriber of a source or a gate receives
+which events. Set it with the `dispatcher` builder function; there are
+three:
+
+- `dispatcher.demand()` (the default): each event goes to exactly one
+  subscriber, the one with the largest open demand. Thus the load becomes
+  equal across the subscribers with time.
+- `dispatcher.broadcast()`: each event goes to each subscriber, at the
+  speed of the slowest subscriber. A subscriber can set a filter with
+  `sluice.selector(keep: fn(event) { ... })`; it then receives only the
+  events that the filter keeps.
+- `dispatcher.partition(count:, by:)`: the `by` function gives each event
+  a partition, and each partition has a maximum of one subscriber. A
+  subscriber selects its partition with `sluice.partition(index:)`.
+  Events for a partition without open demand wait in a queue for that
+  partition; thus a slow partition does not stop the other partitions.
+
+```gleam
+import sluice/dispatcher
+
+let assert Ok(measurements) =
+  sensor_source()
+  |> source.dispatcher(dispatcher.partition(count: 4, by: fn(measurement) {
+    measurement.sensor_id
+  }))
+  |> source.start()
+```
+
 ## Manual demand
 
 Some consumers must control the flow themselves, for example because they
@@ -270,9 +300,9 @@ the correct sequence. Each stage connects again through the names.
 
 ## Roadmap
 
-- Broadcast dispatchers and partition dispatchers. The internal dispatcher
-  interface is prepared for them.
 - Pooled event processing, which sends batches to a group of workers.
+- Subscriber hooks on producer stages.
+- Sources from yielders, and pipelines as folds.
 
 ## Inspiration
 
