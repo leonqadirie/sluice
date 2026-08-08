@@ -168,6 +168,37 @@ The `on_events` callback also receives the subscription. Thus a sink can
 ask for its subsequent batch from inside the callback and set its own
 speed.
 
+## Send messages to a stage
+
+A stage can receive messages of a type of your choice, next to the event
+flow. Use this for timers, for configuration changes, and for queries.
+Give the stage a message channel with `on_message`. At the start, the
+`initialise` callback receives the subject of the channel. The handler
+receives each message together with the state, and it has the full
+vocabulary of the stage. Thus a source or a gate can emit events from
+it:
+
+```gleam
+let assert Ok(prices) =
+  source.new(init: Nil, on_demand: fn(state, _demand) {
+    source.emit([], state)
+  })
+  |> source.on_message(
+    initialise: fn(subject) {
+      // A tick every second.
+      let _timer = process.send_after(subject, 1000, Tick)
+      Nil
+    },
+    handler: fn(state, message) {
+      case message {
+        Tick -> source.emit([read_price()], state)
+        Refresh(new_source) -> source.emit([], new_source)
+      }
+    },
+  )
+  |> source.start()
+```
+
 ## When stages stop
 
 Each subscription has a cancel mode. The cancel mode tells the consumer

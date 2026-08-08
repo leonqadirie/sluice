@@ -67,6 +67,7 @@ pub opaque type Builder(state, event) {
     name: Option(Name(event)),
     subscriptions: List(SubscriptionOptions(event)),
     start_timeout: Int,
+    messages: Option(fn() -> Selector(Message(state, event))),
   )
 }
 
@@ -82,6 +83,7 @@ pub fn new(
     name: None,
     subscriptions: [],
     start_timeout: 5000,
+    messages: None,
   )
 }
 
@@ -94,6 +96,29 @@ pub fn subscribe(
   options options: SubscriptionOptions(event),
 ) -> Builder(state, event) {
   Builder(..builder, subscriptions: [options, ..builder.subscriptions])
+}
+
+/// Give the sink a private message channel with a type of your choice.
+/// At the start, `initialise` receives the subject of the channel: send it
+/// to other processes, or start a timer with `process.send_after`. The
+/// handler receives each message together with the state. Use this for
+/// timers, for configuration changes, and for queries.
+pub fn on_message(
+  builder: Builder(state, event),
+  initialise initialise: fn(Subject(user_message)) -> Nil,
+  handler handler: fn(state, user_message) -> Next(state),
+) -> Builder(state, event) {
+  Builder(
+    ..builder,
+    messages: Some(fn() {
+      let subject = process.new_subject()
+      initialise(subject)
+      process.new_selector()
+      |> process.select_map(subject, fn(user_message) {
+        FromUser(fn(state) { handler(state, user_message) })
+      })
+    }),
+  )
 }
 
 /// The maximum time for the start of the sink, which includes its
@@ -113,20 +138,21 @@ pub fn named(
   Builder(..builder, name: Some(name))
 }
 
-type Message(event) {
+type Message(state, event) {
   Control(control: sluice.ConsumerControl(event))
   FromUpstream(
     subject: Subject(ConsumerMessage(event)),
     message: ConsumerMessage(event),
   )
   ProducerDown(subject: Subject(ConsumerMessage(event)), down: Down)
+  FromUser(apply: fn(state) -> Next(state))
 }
 
 type State(state, event) {
   State(
     user_state: state,
     core: consumer_core.Core(event),
-    selector: Selector(Message(event)),
+    selector: Selector(Message(state, event)),
     control_subject: Subject(sluice.ConsumerControl(event)),
     on_events: fn(state, List(event), Subscription) -> Next(state),
   )
@@ -148,7 +174,7 @@ pub fn start(
 fn initialise(
   builder: Builder(state, event),
 ) -> Result(
-  actor.Initialised(State(state, event), Message(event), Inlet(event)),
+  actor.Initialised(State(state, event), Message(state, event), Inlet(event)),
   String,
 ) {
   let faces = case builder.name {
@@ -172,6 +198,10 @@ fn initialise(
     Ok(#(control_subject, inlet)) -> {
       let selector =
         process.new_selector() |> process.select_map(control_subject, Control)
+      let selector = case builder.messages {
+        None -> selector
+        Some(install) -> process.merge_selector(selector, install())
+      }
       let state =
         State(
           user_state: builder.state,
@@ -246,8 +276,8 @@ fn ask_closure(
 
 fn handle_message(
   state: State(state, event),
-  message: Message(event),
-) -> actor.Next(State(state, event), Message(event)) {
+  message: Message(state, event),
+) -> actor.Next(State(state, event), Message(state, event)) {
   case message {
     Control(sluice.SubscribeTo(
       producer,
@@ -322,6 +352,12 @@ fn handle_message(
           )
         process.PortDown(..) -> actor.continue(state)
       }
+    FromUser(apply) ->
+      case apply(state.user_state) {
+        Continue(user_state) -> actor.continue(State(..state, user_state:))
+        Stop -> actor.stop()
+        StopAbnormal(reason) -> actor.stop_abnormal(reason)
+      }
   }
 }
 
@@ -342,7 +378,7 @@ fn subscription_closed(
   state state: State(state, event),
   subject subject: Subject(ConsumerMessage(event)),
   reason reason: protocol.CancelReason,
-) -> actor.Next(State(state, event), Message(event)) {
+) -> actor.Next(State(state, event), Message(state, event)) {
   let #(core, selector, outcome) =
     consumer_core.closed(state.core, state.selector, subject, reason)
   let state = State(..state, core:, selector:)
@@ -355,6 +391,6 @@ fn subscription_closed(
 
 fn continue_with(
   state: State(state, event),
-) -> actor.Next(State(state, event), Message(event)) {
+) -> actor.Next(State(state, event), Message(state, event)) {
   actor.continue(state) |> actor.with_selector(state.selector)
 }

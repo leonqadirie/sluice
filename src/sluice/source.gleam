@@ -110,6 +110,7 @@ pub opaque type Builder(state, event) {
     name: Option(Name(event)),
     start_timeout: Int,
     on_discard: fn(state, Int) -> state,
+    messages: Option(fn() -> Selector(Message(state, event))),
   )
 }
 
@@ -136,6 +137,7 @@ pub fn new(
     name: None,
     start_timeout: 5000,
     on_discard: default_on_discard,
+    messages: None,
   )
 }
 
@@ -155,6 +157,7 @@ pub fn new_with_emitter(
     name: None,
     start_timeout: 5000,
     on_discard: default_on_discard,
+    messages: None,
   )
 }
 
@@ -191,6 +194,30 @@ pub fn buffer_keep(
   Builder(..builder, keep:)
 }
 
+/// Give the source a private message channel with a type of your choice.
+/// At the start, `initialise` receives the subject of the channel: send it
+/// to other processes, or start a timer with `process.send_after`. The
+/// handler receives each message together with the state, and it can emit
+/// events, like the demand handler. Use this for timers, for configuration
+/// changes, and for queries.
+pub fn on_message(
+  builder: Builder(state, event),
+  initialise initialise: fn(Subject(user_message)) -> Nil,
+  handler handler: fn(state, user_message) -> Produce(state, event),
+) -> Builder(state, event) {
+  Builder(
+    ..builder,
+    messages: Some(fn() {
+      let subject = process.new_subject()
+      initialise(subject)
+      process.new_selector()
+      |> process.select_map(subject, fn(user_message) {
+        FromUser(fn(state) { handler(state, user_message) })
+      })
+    }),
+  )
+}
+
 /// Set the response of the source to discarded events. The callback
 /// receives the state and the quantity of discarded events. The default
 /// response writes a warning to the log.
@@ -218,17 +245,18 @@ pub fn named(
   Builder(..builder, name: Some(name))
 }
 
-type Message(event) {
+type Message(state, event) {
   FromDownstream(message: ProducerMessage(event))
   SubscriberDown(from: Subject(ConsumerMessage(event)), down: Down)
   FromEmitter(message: EmitterMessage(event))
+  FromUser(apply: fn(state) -> Produce(state, event))
 }
 
 type State(state, event) {
   State(
     user_state: state,
     core: producer_core.Core(event),
-    selector: Selector(Message(event)),
+    selector: Selector(Message(state, event)),
     on_demand: fn(state, Int) -> Produce(state, event),
     on_discard: fn(state, Int) -> state,
   )
@@ -250,7 +278,7 @@ pub fn start(
 fn initialise(
   builder: Builder(state, event),
 ) -> Result(
-  actor.Initialised(State(state, event), Message(event), Outlet(event)),
+  actor.Initialised(State(state, event), Message(state, event), Outlet(event)),
   String,
 ) {
   let emitter_subject = process.new_subject()
@@ -283,7 +311,8 @@ fn initialise(
   }
   case faces {
     Error(reason) -> Error(reason)
-    Ok(#(outlet, selector)) ->
+    Ok(#(outlet, selector)) -> {
+      let selector = merge_user_messages(selector, builder.messages)
       case builder.initialise(Emitter(emitter_subject)) {
         Error(reason) -> Error(reason)
         Ok(user_state) -> {
@@ -304,13 +333,24 @@ fn initialise(
           |> Ok
         }
       }
+    }
+  }
+}
+
+fn merge_user_messages(
+  selector: Selector(Message(state, event)),
+  messages: Option(fn() -> Selector(Message(state, event))),
+) -> Selector(Message(state, event)) {
+  case messages {
+    None -> selector
+    Some(install) -> process.merge_selector(selector, install())
   }
 }
 
 fn handle_message(
   state: State(state, event),
-  message: Message(event),
-) -> actor.Next(State(state, event), Message(event)) {
+  message: Message(state, event),
+) -> actor.Next(State(state, event), Message(state, event)) {
   case message {
     FromDownstream(protocol.Subscribe(from, metadata)) -> {
       let #(core, selector, outbound) =
@@ -365,14 +405,22 @@ fn handle_message(
       actor.continue(State(..state, core:, user_state:))
     }
     FromEmitter(Finished) -> actor.stop()
+    FromUser(apply) -> apply_produce(state, apply(state.user_state))
   }
 }
 
 fn produce(
   state: State(state, event),
   demand: Int,
-) -> actor.Next(State(state, event), Message(event)) {
-  case state.on_demand(state.user_state, demand) {
+) -> actor.Next(State(state, event), Message(state, event)) {
+  apply_produce(state, state.on_demand(state.user_state, demand))
+}
+
+fn apply_produce(
+  state: State(state, event),
+  produced: Produce(state, event),
+) -> actor.Next(State(state, event), Message(state, event)) {
+  case produced {
     Emit(events, user_state) -> {
       let producer_core.EmitResult(core:, outbound:, discarded:) =
         producer_core.emit(state.core, events)
@@ -387,7 +435,7 @@ fn produce(
 
 fn continue_with(
   state: State(state, event),
-) -> actor.Next(State(state, event), Message(event)) {
+) -> actor.Next(State(state, event), Message(state, event)) {
   actor.continue(state) |> actor.with_selector(state.selector)
 }
 

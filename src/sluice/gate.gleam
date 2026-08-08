@@ -123,6 +123,7 @@ pub opaque type Builder(state, in, out) {
     subscriptions: List(SubscriptionOptions(in)),
     start_timeout: Int,
     on_discard: fn(state, Int) -> state,
+    messages: Option(fn() -> Selector(Message(state, in, out))),
   )
 }
 
@@ -142,6 +143,7 @@ pub fn new(
     subscriptions: [],
     start_timeout: 5000,
     on_discard: default_on_discard,
+    messages: None,
   )
 }
 
@@ -163,6 +165,30 @@ pub fn on_discard(
   on_discard: fn(state, Int) -> state,
 ) -> Builder(state, in, out) {
   Builder(..builder, on_discard:)
+}
+
+/// Give the gate a private message channel with a type of your choice.
+/// At the start, `initialise` receives the subject of the channel: send it
+/// to other processes, or start a timer with `process.send_after`. The
+/// handler receives each message together with the state, and it can emit
+/// events to the stages after the gate. Use this for timers, for
+/// configuration changes, and for queries.
+pub fn on_message(
+  builder: Builder(state, in, out),
+  initialise initialise: fn(Subject(user_message)) -> Nil,
+  handler handler: fn(state, user_message) -> Transform(state, out),
+) -> Builder(state, in, out) {
+  Builder(
+    ..builder,
+    messages: Some(fn() {
+      let subject = process.new_subject()
+      initialise(subject)
+      process.new_selector()
+      |> process.select_map(subject, fn(user_message) {
+        FromUser(fn(state) { handler(state, user_message) })
+      })
+    }),
+  )
 }
 
 /// The maximum time for the start of the gate, which includes its declared
@@ -210,7 +236,7 @@ pub fn named(
   Builder(..builder, name: Some(name))
 }
 
-type Message(in, out) {
+type Message(state, in, out) {
   Control(control: sluice.ConsumerControl(in))
   FromUpstream(
     subject: Subject(ConsumerMessage(in)),
@@ -219,6 +245,7 @@ type Message(in, out) {
   UpstreamDown(subject: Subject(ConsumerMessage(in)), down: Down)
   FromDownstream(message: ProducerMessage(out))
   SubscriberDown(from: Subject(ConsumerMessage(out)), down: Down)
+  FromUser(apply: fn(state) -> Transform(state, out))
 }
 
 type State(state, in, out) {
@@ -226,7 +253,7 @@ type State(state, in, out) {
     user_state: state,
     consumer: consumer_core.Core(in),
     producer: producer_core.Core(out),
-    selector: Selector(Message(in, out)),
+    selector: Selector(Message(state, in, out)),
     control_subject: Subject(sluice.ConsumerControl(in)),
     on_events: fn(state, List(in), Subscription) -> Transform(state, out),
     on_discard: fn(state, Int) -> state,
@@ -249,7 +276,11 @@ pub fn start(
 fn initialise(
   builder: Builder(state, in, out),
 ) -> Result(
-  actor.Initialised(State(state, in, out), Message(in, out), Gate(in, out)),
+  actor.Initialised(
+    State(state, in, out),
+    Message(state, in, out),
+    Gate(in, out),
+  ),
   String,
 ) {
   let control_subject = process.new_subject()
@@ -281,6 +312,10 @@ fn initialise(
   case selector {
     Error(reason) -> Error(reason)
     Ok(selector) -> {
+      let selector = case builder.messages {
+        None -> selector
+        Some(install) -> process.merge_selector(selector, install())
+      }
       let gate =
         Gate(
           inlet: sluice.make_inlet(
@@ -373,8 +408,8 @@ fn ask_closure(
 
 fn handle_message(
   state: State(state, in, out),
-  message: Message(in, out),
-) -> actor.Next(State(state, in, out), Message(in, out)) {
+  message: Message(state, in, out),
+) -> actor.Next(State(state, in, out), Message(state, in, out)) {
   case message {
     Control(sluice.SubscribeTo(
       producer,
@@ -483,6 +518,21 @@ fn handle_message(
       producer_core.send_all(outbound)
       continue_with(State(..state, producer:, selector:))
     }
+    FromUser(apply) ->
+      case apply(state.user_state) {
+        Emit(produced, user_state) -> {
+          let producer_core.EmitResult(core: producer, outbound:, discarded:) =
+            producer_core.emit(state.producer, produced)
+          producer_core.send_all(outbound)
+          let user_state = case discarded > 0 {
+            True -> state.on_discard(user_state, discarded)
+            False -> user_state
+          }
+          actor.continue(State(..state, producer:, user_state:))
+        }
+        Stop -> actor.stop()
+        StopAbnormal(reason) -> actor.stop_abnormal(reason)
+      }
   }
 }
 
@@ -490,7 +540,7 @@ fn transform(
   state state: State(state, in, out),
   subject subject: Subject(ConsumerMessage(in)),
   events events: List(in),
-) -> actor.Next(State(state, in, out), Message(in, out)) {
+) -> actor.Next(State(state, in, out), Message(state, in, out)) {
   let on_events = state.on_events
   let on_discard = state.on_discard
   let #(consumer, #(user_state, producer), outcome) =
@@ -538,7 +588,7 @@ fn upstream_closed(
   state state: State(state, in, out),
   subject subject: Subject(ConsumerMessage(in)),
   reason reason: protocol.CancelReason,
-) -> actor.Next(State(state, in, out), Message(in, out)) {
+) -> actor.Next(State(state, in, out), Message(state, in, out)) {
   let #(consumer, selector, outcome) =
     consumer_core.closed(state.consumer, state.selector, subject, reason)
   let state = State(..state, consumer:, selector:)
@@ -551,6 +601,6 @@ fn upstream_closed(
 
 fn continue_with(
   state: State(state, in, out),
-) -> actor.Next(State(state, in, out), Message(in, out)) {
+) -> actor.Next(State(state, in, out), Message(state, in, out)) {
   actor.continue(state) |> actor.with_selector(state.selector)
 }
