@@ -23,8 +23,8 @@ demand:   Source ◀── Gate ◀── Sink
 
 Nothing moves until the consuming side asks for events. Because of this,
 a slow sink is never overwhelmed: backpressure spreads to the stages
-before it, mailboxes stay bounded, and you never need to poll. No event
-is dropped silently: a stage that must drop events logs a warning first.
+before it and mailboxes stay bounded. No event is dropped silently:
+a stage that must drop events logs a warning first.
 
 ## When to use sluice
 
@@ -234,8 +234,7 @@ The producers must share one event type; to merge sources with different
 types, see [Design notes](#design-notes).
 
 Combine both and a pipeline becomes a graph: one source feeding several
-gates, or several gates feeding one sink, with demand accounted for on
-every connection.
+gates, or several gates feeding one sink.
 
 ## Dispatchers
 
