@@ -5,32 +5,11 @@
 import gleam/erlang/process.{type Subject}
 import gleam/int
 import gleam/list
-import gleam/otp/actor.{type Started}
 import sluice
 import sluice/gate
 import sluice/sink
 import sluice/source
-
-fn count_up(from: Int, count: Int) -> List(Int) {
-  int.range(from: from, to: from + count, with: [], run: list.prepend)
-  |> list.reverse
-}
-
-fn counter_source(demand_probe: Subject(Int)) {
-  source.new(init: 0, on_demand: fn(counter, demand) {
-    process.send(demand_probe, demand)
-    source.emit(count_up(counter, demand), counter + demand)
-  })
-}
-
-fn shutdown(started: Started(data)) -> Nil {
-  process.unlink(started.pid)
-  process.kill(started.pid)
-}
-
-fn small_demand(options: sluice.SubscriptionOptions(event)) {
-  options |> sluice.min_demand(2) |> sluice.max_demand(6)
-}
+import support
 
 // The primary type-safety property: events from an Int source go through
 // an Int -> String gate into a String sink. The compilation of this test
@@ -40,7 +19,7 @@ pub fn heterogeneous_typed_chain_test() {
   let batch_probe: Subject(#(List(String), Subject(Nil))) =
     process.new_subject()
   let assert Ok(counter) =
-    counter_source(process.new_subject()) |> source.start()
+    support.counter_source_with_probe(process.new_subject()) |> source.start()
   let assert Ok(stringifier) =
     gate.new(init: Nil, on_events: fn(state, events, _subscription) {
       gate.emit(list.map(events, int.to_string), state)
@@ -57,22 +36,22 @@ pub fn heterogeneous_typed_chain_test() {
 
   let assert Ok(_) =
     sluice.subscription(to: counter.data)
-    |> small_demand
+    |> support.small_demand
     |> sluice.subscribe(consumer: gate.inlet(stringifier.data))
   let assert Ok(_) =
     sluice.subscription(to: gate.outlet(stringifier.data))
-    |> small_demand
+    |> support.small_demand
     |> sluice.subscribe(consumer: collector.data)
 
   let assert Ok(#(first_batch, step)) = process.receive(batch_probe, 1000)
   assert list.first(first_batch) == Ok("0")
   assert first_batch
-    == list.map(count_up(0, list.length(first_batch)), int.to_string)
+    == list.map(support.count_up(0, list.length(first_batch)), int.to_string)
   process.send(step, Nil)
 
-  shutdown(collector)
-  shutdown(stringifier)
-  shutdown(counter)
+  support.shutdown(collector)
+  support.shutdown(stringifier)
+  support.shutdown(counter)
 }
 
 // A gate can be a filter. It then emits fewer events than it receives.
@@ -81,7 +60,7 @@ pub fn heterogeneous_typed_chain_test() {
 pub fn filtering_gate_keeps_pipeline_moving_test() {
   let batch_probe = process.new_subject()
   let assert Ok(counter) =
-    counter_source(process.new_subject()) |> source.start()
+    support.counter_source_with_probe(process.new_subject()) |> source.start()
   let assert Ok(evens_only) =
     gate.new(init: Nil, on_events: fn(state, events, _subscription) {
       gate.emit(list.filter(events, fn(event) { event % 2 == 0 }), state)
@@ -103,19 +82,19 @@ pub fn filtering_gate_keeps_pipeline_moving_test() {
 
   let assert Ok(_) =
     sluice.subscription(to: counter.data)
-    |> small_demand
+    |> support.small_demand
     |> sluice.subscribe(consumer: gate.inlet(evens_only.data))
   let assert Ok(_) =
     sluice.subscription(to: gate.outlet(evens_only.data))
-    |> small_demand
+    |> support.small_demand
     |> sluice.subscribe(consumer: collector.data)
 
   let assert Ok(#(first_batch, _total)) = process.receive(batch_probe, 1000)
   assert list.all(first_batch, fn(event) { event % 2 == 0 })
   assert list.first(first_batch) == Ok(0)
 
-  shutdown(evens_only)
-  shutdown(counter)
+  support.shutdown(evens_only)
+  support.shutdown(counter)
 }
 
 // The demand connection: the sink does not continue, and the gate buffer
@@ -124,7 +103,8 @@ pub fn filtering_gate_keeps_pipeline_moving_test() {
 pub fn gate_holds_upstream_asks_while_downstream_idle_test() {
   let demand_probe = process.new_subject()
   let batch_probe = process.new_subject()
-  let assert Ok(counter) = counter_source(demand_probe) |> source.start()
+  let assert Ok(counter) =
+    support.counter_source_with_probe(demand_probe) |> source.start()
   let assert Ok(doubler) =
     gate.new(init: Nil, on_events: fn(state, events, _subscription) {
       gate.emit(list.map(events, fn(event) { event * 2 }), state)
@@ -141,11 +121,11 @@ pub fn gate_holds_upstream_asks_while_downstream_idle_test() {
 
   let assert Ok(_) =
     sluice.subscription(to: counter.data)
-    |> small_demand
+    |> support.small_demand
     |> sluice.subscribe(consumer: gate.inlet(doubler.data))
   let assert Ok(_) =
     sluice.subscription(to: gate.outlet(doubler.data))
-    |> small_demand
+    |> support.small_demand
     |> sluice.subscribe(consumer: collector.data)
 
   // Receive the first source demand while the sink stays on its first
@@ -163,16 +143,16 @@ pub fn gate_holds_upstream_asks_while_downstream_idle_test() {
   let assert Ok(#(_second_batch, _step)) = process.receive(batch_probe, 1000)
   let assert Ok(_) = process.receive(demand_probe, 1000)
 
-  shutdown(collector)
-  shutdown(doubler)
-  shutdown(counter)
+  support.shutdown(collector)
+  support.shutdown(doubler)
+  support.shutdown(counter)
 }
 
 // A gate that is complete stops with the normal reason. A gate that has
 // a failure stops with a failure reason. Monitors show the two results.
 pub fn gate_stop_decisions_propagate_test() {
   let assert Ok(counter) =
-    counter_source(process.new_subject()) |> source.start()
+    support.counter_source_with_probe(process.new_subject()) |> source.start()
   let assert Ok(closer) =
     gate.new(init: Nil, on_events: fn(_state, _events, _subscription) {
       gate.stop()
@@ -184,7 +164,7 @@ pub fn gate_stop_decisions_propagate_test() {
 
   let assert Ok(_) =
     sluice.subscription(to: counter.data)
-    |> small_demand
+    |> support.small_demand
     |> sluice.subscribe(consumer: gate.inlet(closer.data))
   let closer_selector =
     process.new_selector()
@@ -201,7 +181,7 @@ pub fn gate_stop_decisions_propagate_test() {
   let aborter_monitor = process.monitor(aborter.pid)
   let assert Ok(_) =
     sluice.subscription(to: counter.data)
-    |> small_demand
+    |> support.small_demand
     |> sluice.subscribe(consumer: gate.inlet(aborter.data))
   let aborter_selector =
     process.new_selector()
@@ -209,7 +189,7 @@ pub fn gate_stop_decisions_propagate_test() {
   let assert Ok(process.ProcessDown(_, _, process.Abnormal(_))) =
     process.selector_receive(aborter_selector, 2000)
 
-  shutdown(counter)
+  support.shutdown(counter)
 }
 
 pub fn gate_cannot_subscribe_to_itself_test() {
@@ -223,7 +203,7 @@ pub fn gate_cannot_subscribe_to_itself_test() {
     |> sluice.subscribe(consumer: gate.inlet(doubler.data))
     == Error(sluice.SelfSubscription)
 
-  shutdown(doubler)
+  support.shutdown(doubler)
 }
 
 // A gate that makes more events than the demand after it, with a buffer
@@ -235,7 +215,7 @@ pub fn gate_reports_discarded_events_test() {
     source.new(init: False, on_demand: fn(exhausted, _demand) {
       case exhausted {
         True -> source.emit([], True)
-        False -> source.emit(count_up(1, 6), True)
+        False -> source.emit(support.count_up(1, 6), True)
       }
     })
     |> source.start()
@@ -264,11 +244,11 @@ pub fn gate_reports_discarded_events_test() {
 
   let assert Ok(_) =
     sluice.subscription(to: gate.outlet(expander.data))
-    |> small_demand
+    |> support.small_demand
     |> sluice.subscribe(consumer: collector.data)
   let assert Ok(_) =
     sluice.subscription(to: finite.data)
-    |> small_demand
+    |> support.small_demand
     |> sluice.subscribe(consumer: gate.inlet(expander.data))
 
   // The gate changes 4 events into 12. The sink asked for 6. The buffer
@@ -276,7 +256,7 @@ pub fn gate_reports_discarded_events_test() {
   let assert Ok(first_discard) = process.receive(discard_probe, 1000)
   assert first_discard > 0
 
-  shutdown(collector)
-  shutdown(expander)
-  shutdown(finite)
+  support.shutdown(collector)
+  support.shutdown(expander)
+  support.shutdown(finite)
 }

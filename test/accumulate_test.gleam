@@ -1,22 +1,10 @@
 //// Tests for the accumulation of demand on a source.
 
 import gleam/erlang/process
-import gleam/int
-import gleam/list
-import gleam/otp/actor.{type Started}
 import sluice
 import sluice/sink
 import sluice/source
-
-fn count_up(from: Int, count: Int) -> List(Int) {
-  int.range(from: from, to: from + count, with: [], run: list.prepend)
-  |> list.reverse
-}
-
-fn shutdown(started: Started(data)) -> Nil {
-  process.unlink(started.pid)
-  process.kill(started.pid)
-}
+import support
 
 // A source in the accumulation mode holds the asks. The forward call
 // releases them, and the source receives the collected demand in one
@@ -27,7 +15,7 @@ pub fn accumulated_demand_moves_on_forward_test() {
   let assert Ok(counter) =
     source.new(init: 0, on_demand: fn(counter, demand) {
       process.send(demand_probe, demand)
-      source.emit(count_up(counter, demand), counter + demand)
+      source.emit(support.count_up(counter, demand), counter + demand)
     })
     |> source.accumulate_demand()
     |> source.start()
@@ -54,8 +42,8 @@ pub fn accumulated_demand_moves_on_forward_test() {
   let assert Ok(6) = process.receive(demand_probe, 1000)
   let assert Ok([0, 1, 2, 3]) = process.receive(batch_probe, 1000)
 
-  shutdown(collector)
-  shutdown(counter)
+  support.shutdown(collector)
+  support.shutdown(counter)
 }
 
 // A second forward call changes nothing: the source is already in the
@@ -65,7 +53,7 @@ pub fn forward_is_idempotent_test() {
   let assert Ok(counter) =
     source.new(init: 0, on_demand: fn(counter, demand) {
       process.send(demand_probe, demand)
-      source.emit(count_up(counter, demand), counter + demand)
+      source.emit(support.count_up(counter, demand), counter + demand)
     })
     |> source.accumulate_demand()
     |> source.start()
@@ -85,6 +73,6 @@ pub fn forward_is_idempotent_test() {
   let assert Ok(6) = process.receive(demand_probe, 1000)
   sluice.forward_demand(outlet: counter.data)
 
-  shutdown(collector)
-  shutdown(counter)
+  support.shutdown(collector)
+  support.shutdown(counter)
 }

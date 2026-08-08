@@ -3,27 +3,12 @@
 //// command to a sink.
 
 import gleam/erlang/process
-import gleam/int
 import gleam/list
-import gleam/otp/actor.{type Started}
 import sluice
 import sluice/gate
 import sluice/sink
 import sluice/source
-
-fn count_up(from: Int, count: Int) -> List(Int) {
-  int.range(from: from, to: from + count, with: [], run: list.prepend)
-  |> list.reverse
-}
-
-fn shutdown(started: Started(data)) -> Nil {
-  process.unlink(started.pid)
-  process.kill(started.pid)
-}
-
-fn small_demand(options: sluice.SubscriptionOptions(event)) {
-  options |> sluice.min_demand(2) |> sluice.max_demand(6)
-}
+import support
 
 type SourceCommand {
   Inject(Int)
@@ -67,7 +52,7 @@ pub fn source_message_channel_test() {
 
   let assert Ok(_) =
     sluice.subscription(to: silent.data)
-    |> small_demand
+    |> support.small_demand
     |> sluice.subscribe(consumer: collector.data)
 
   // The timer message arrives first and becomes an event.
@@ -97,7 +82,7 @@ pub fn gate_reconfiguration_test() {
   let batch_probe = process.new_subject()
   let assert Ok(counter) =
     source.new(init: 0, on_demand: fn(counter, demand) {
-      source.emit(count_up(counter, demand), counter + demand)
+      source.emit(support.count_up(counter, demand), counter + demand)
     })
     |> source.start()
   let assert Ok(multiplier) =
@@ -139,9 +124,9 @@ pub fn gate_reconfiguration_test() {
   sluice.ask(subscription: downstream, count: 2)
   let assert Ok([20, 30]) = process.receive(batch_probe, 1000)
 
-  shutdown(collector)
-  shutdown(multiplier)
-  shutdown(counter)
+  support.shutdown(collector)
+  support.shutdown(multiplier)
+  support.shutdown(counter)
 }
 
 type SinkCommand {

@@ -3,36 +3,18 @@
 //// partition.
 
 import gleam/erlang/process.{type Subject}
-import gleam/int
 import gleam/list
-import gleam/otp/actor.{type Started}
 import sluice
 import sluice/dispatcher
 import sluice/sink
 import sluice/source
-
-fn count_up(from: Int, count: Int) -> List(Int) {
-  int.range(from: from, to: from + count, with: [], run: list.prepend)
-  |> list.reverse
-}
+import support
 
 fn partitioned_counter() {
   source.new(init: 0, on_demand: fn(counter, demand) {
-    source.emit(count_up(counter, demand), counter + demand)
+    source.emit(support.count_up(counter, demand), counter + demand)
   })
   |> source.dispatcher(dispatcher.partition(count: 2, by: fn(event) { event }))
-}
-
-fn collector(batch_probe: Subject(List(Int))) {
-  sink.new(init: Nil, on_events: fn(state, events, _subscription) {
-    process.send(batch_probe, events)
-    sink.continue(state)
-  })
-}
-
-fn shutdown(started: Started(data)) -> Nil {
-  process.unlink(started.pid)
-  process.kill(started.pid)
 }
 
 fn collect(
@@ -57,8 +39,8 @@ pub fn partition_routes_by_hash_test() {
   let even_probe = process.new_subject()
   let odd_probe = process.new_subject()
   let assert Ok(counter) = partitioned_counter() |> source.start()
-  let assert Ok(evens) = collector(even_probe) |> sink.start()
-  let assert Ok(odds) = collector(odd_probe) |> sink.start()
+  let assert Ok(evens) = support.collector(even_probe) |> sink.start()
+  let assert Ok(odds) = support.collector(odd_probe) |> sink.start()
 
   let assert Ok(even_subscription) =
     sluice.subscription(to: counter.data)
@@ -83,9 +65,9 @@ pub fn partition_routes_by_hash_test() {
   assert collect(even_probe, 2, [0]) == [0, 2]
   assert collect(odd_probe, 2, []) == [1, 3]
 
-  shutdown(odds)
-  shutdown(evens)
-  shutdown(counter)
+  support.shutdown(odds)
+  support.shutdown(evens)
+  support.shutdown(counter)
 }
 
 // A partition dispatcher refuses a subscription without a partition. The
@@ -112,14 +94,14 @@ pub fn partition_requires_an_index_test() {
   let assert Ok(process.ProcessDown(_, _, process.Abnormal(_))) =
     process.selector_receive(down_selector, 2000)
 
-  shutdown(counter)
+  support.shutdown(counter)
 }
 
 // One partition accepts a maximum of one subscriber.
 pub fn partition_accepts_one_subscriber_test() {
   let batch_probe = process.new_subject()
   let assert Ok(counter) = partitioned_counter() |> source.start()
-  let assert Ok(holder) = collector(batch_probe) |> sink.start()
+  let assert Ok(holder) = support.collector(batch_probe) |> sink.start()
   let assert Ok(second) =
     sink.new(init: Nil, on_events: fn(state, _events, _subscription) {
       sink.continue(state)
@@ -144,6 +126,6 @@ pub fn partition_accepts_one_subscriber_test() {
   let assert Ok(process.ProcessDown(_, _, process.Abnormal(_))) =
     process.selector_receive(down_selector, 2000)
 
-  shutdown(holder)
-  shutdown(counter)
+  support.shutdown(holder)
+  support.shutdown(counter)
 }

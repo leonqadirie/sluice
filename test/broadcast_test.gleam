@@ -2,38 +2,20 @@
 //// speed of the slowest subscriber, per-subscriber filters, and the
 //// demand that a removal releases.
 
-import gleam/erlang/process.{type Subject}
-import gleam/int
+import gleam/erlang/process
 import gleam/list
-import gleam/otp/actor.{type Started}
 import sluice
 import sluice/dispatcher
 import sluice/gate
 import sluice/sink
 import sluice/source
-
-fn count_up(from: Int, count: Int) -> List(Int) {
-  int.range(from: from, to: from + count, with: [], run: list.prepend)
-  |> list.reverse
-}
+import support
 
 fn broadcast_counter() {
   source.new(init: 0, on_demand: fn(counter, demand) {
-    source.emit(count_up(counter, demand), counter + demand)
+    source.emit(support.count_up(counter, demand), counter + demand)
   })
   |> source.dispatcher(dispatcher.broadcast())
-}
-
-fn collector(batch_probe: Subject(List(Int))) {
-  sink.new(init: Nil, on_events: fn(state, events, _subscription) {
-    process.send(batch_probe, events)
-    sink.continue(state)
-  })
-}
-
-fn shutdown(started: Started(data)) -> Nil {
-  process.unlink(started.pid)
-  process.kill(started.pid)
 }
 
 // The manual mode makes the sequence deterministic: the flow starts only
@@ -43,8 +25,8 @@ pub fn broadcast_delivers_to_all_subscribers_test() {
   let first_probe = process.new_subject()
   let second_probe = process.new_subject()
   let assert Ok(counter) = broadcast_counter() |> source.start()
-  let assert Ok(first) = collector(first_probe) |> sink.start()
-  let assert Ok(second) = collector(second_probe) |> sink.start()
+  let assert Ok(first) = support.collector(first_probe) |> sink.start()
+  let assert Ok(second) = support.collector(second_probe) |> sink.start()
 
   let assert Ok(first_subscription) =
     sluice.subscription(to: counter.data)
@@ -65,17 +47,17 @@ pub fn broadcast_delivers_to_all_subscribers_test() {
   let assert Ok([0, 1, 2, 3]) = process.receive(first_probe, 1000)
   let assert Ok([0, 1, 2, 3]) = process.receive(second_probe, 1000)
 
-  shutdown(second)
-  shutdown(first)
-  shutdown(counter)
+  support.shutdown(second)
+  support.shutdown(first)
+  support.shutdown(counter)
 }
 
 pub fn broadcast_selector_filters_per_subscriber_test() {
   let all_probe = process.new_subject()
   let even_probe = process.new_subject()
   let assert Ok(counter) = broadcast_counter() |> source.start()
-  let assert Ok(all_events) = collector(all_probe) |> sink.start()
-  let assert Ok(even_events) = collector(even_probe) |> sink.start()
+  let assert Ok(all_events) = support.collector(all_probe) |> sink.start()
+  let assert Ok(even_events) = support.collector(even_probe) |> sink.start()
 
   let assert Ok(all_subscription) =
     sluice.subscription(to: counter.data)
@@ -92,9 +74,9 @@ pub fn broadcast_selector_filters_per_subscriber_test() {
   let assert Ok([0, 1, 2, 3]) = process.receive(all_probe, 1000)
   let assert Ok([0, 2]) = process.receive(even_probe, 1000)
 
-  shutdown(even_events)
-  shutdown(all_events)
-  shutdown(counter)
+  support.shutdown(even_events)
+  support.shutdown(all_events)
+  support.shutdown(counter)
 }
 
 // A subscriber with a filter must not stall the automatic demand: the
@@ -103,8 +85,9 @@ pub fn broadcast_selector_filters_per_subscriber_test() {
 pub fn selector_does_not_stall_automatic_demand_test() {
   let even_probe = process.new_subject()
   let assert Ok(counter) = broadcast_counter() |> source.start()
-  let assert Ok(all_events) = collector(process.new_subject()) |> sink.start()
-  let assert Ok(even_events) = collector(even_probe) |> sink.start()
+  let assert Ok(all_events) =
+    support.collector(process.new_subject()) |> sink.start()
+  let assert Ok(even_events) = support.collector(even_probe) |> sink.start()
 
   let assert Ok(_) =
     sluice.subscription(to: counter.data)
@@ -122,13 +105,13 @@ pub fn selector_does_not_stall_automatic_demand_test() {
   // refund for filtered events, the flow stopped after the first round.
   // The filtered subscriber joins a flow that possibly moves, so the
   // test checks the shape of the sequence, not the first value.
-  let received = collect_events(even_probe, 10, [])
+  let received = support.collect_events(even_probe, 10, [])
   assert list.length(received) == 10
   assert consecutive_evens(received)
 
-  shutdown(even_events)
-  shutdown(all_events)
-  shutdown(counter)
+  support.shutdown(even_events)
+  support.shutdown(all_events)
+  support.shutdown(counter)
 }
 
 // Replacement demand must return through the source mailbox. If it is
@@ -144,12 +127,13 @@ pub fn rejecting_selector_does_not_monopolise_source_test() {
     })
     |> source.on_demand(fn(counter, demand) {
       process.send(demand_probe, demand)
-      source.emit(count_up(counter, demand), counter + demand)
+      source.emit(support.count_up(counter, demand), counter + demand)
     })
     |> source.dispatcher(dispatcher.broadcast())
     |> source.start()
   let assert Ok(emitter) = process.receive(emitter_probe, 1000)
-  let assert Ok(rejector) = collector(process.new_subject()) |> sink.start()
+  let assert Ok(rejector) =
+    support.collector(process.new_subject()) |> sink.start()
   process.unlink(counter.pid)
   let monitor = process.monitor(counter.pid)
 
@@ -171,7 +155,7 @@ pub fn rejecting_selector_does_not_monopolise_source_test() {
   let assert Ok(process.ProcessDown(_, _, process.Normal)) =
     process.selector_receive(down_selector, 1000)
 
-  shutdown(rejector)
+  support.shutdown(rejector)
 }
 
 fn consecutive_evens(events: List(Int)) -> Bool {
@@ -185,22 +169,6 @@ fn consecutive_evens(events: List(Int)) -> Bool {
   }
 }
 
-fn collect_events(
-  probe: Subject(List(Int)),
-  target: Int,
-  received: List(Int),
-) -> List(Int) {
-  case list.length(received) >= target {
-    True -> list.take(received, target)
-    False ->
-      case process.receive(probe, 1000) {
-        Error(Nil) -> received
-        Ok(events) ->
-          collect_events(probe, target, list.append(received, events))
-      }
-  }
-}
-
 // A gate can also broadcast: each subscriber of the gate receives the
 // full changed flow.
 pub fn gate_with_broadcast_dispatcher_test() {
@@ -208,7 +176,7 @@ pub fn gate_with_broadcast_dispatcher_test() {
   let second_probe = process.new_subject()
   let assert Ok(counter) =
     source.new(init: 0, on_demand: fn(counter, demand) {
-      source.emit(count_up(counter, demand), counter + demand)
+      source.emit(support.count_up(counter, demand), counter + demand)
     })
     |> source.start()
   let assert Ok(doubler) =
@@ -222,8 +190,8 @@ pub fn gate_with_broadcast_dispatcher_test() {
       |> sluice.max_demand(6),
     )
     |> gate.start()
-  let assert Ok(first) = collector(first_probe) |> sink.start()
-  let assert Ok(second) = collector(second_probe) |> sink.start()
+  let assert Ok(first) = support.collector(first_probe) |> sink.start()
+  let assert Ok(second) = support.collector(second_probe) |> sink.start()
 
   let assert Ok(first_subscription) =
     sluice.subscription(to: gate.outlet(doubler.data))
@@ -239,10 +207,10 @@ pub fn gate_with_broadcast_dispatcher_test() {
   let assert Ok([0, 2, 4]) = process.receive(first_probe, 1000)
   let assert Ok([0, 2, 4]) = process.receive(second_probe, 1000)
 
-  shutdown(second)
-  shutdown(first)
-  shutdown(doubler)
-  shutdown(counter)
+  support.shutdown(second)
+  support.shutdown(first)
+  support.shutdown(doubler)
+  support.shutdown(counter)
 }
 
 // The removal of the slowest subscriber releases demand: the other
@@ -250,7 +218,7 @@ pub fn gate_with_broadcast_dispatcher_test() {
 pub fn broadcast_removal_of_slowest_releases_demand_test() {
   let fast_probe = process.new_subject()
   let assert Ok(counter) = broadcast_counter() |> source.start()
-  let assert Ok(fast) = collector(fast_probe) |> sink.start()
+  let assert Ok(fast) = support.collector(fast_probe) |> sink.start()
   let assert Ok(slow) =
     sink.new(init: Nil, on_events: fn(state, _events, _subscription) {
       sink.continue(state)
@@ -279,7 +247,7 @@ pub fn broadcast_removal_of_slowest_releases_demand_test() {
   sluice.cancel(slow_subscription)
   let assert Ok([2, 3, 4, 5]) = process.receive(fast_probe, 1000)
 
-  shutdown(slow)
-  shutdown(fast)
-  shutdown(counter)
+  support.shutdown(slow)
+  support.shutdown(fast)
+  support.shutdown(counter)
 }

@@ -1,69 +1,20 @@
 //// Full tests for Source -> Sink pipelines. The tests use probe subjects
 //// and lockstep sinks. They do not use sleeps.
 
-import gleam/erlang/process.{type Subject}
+import gleam/erlang/process
 import gleam/int
 import gleam/list
-import gleam/otp/actor.{type Started}
 import sluice
 import sluice/sink
 import sluice/source
-
-fn count_up(from: Int, count: Int) -> List(Int) {
-  int.range(from: from, to: from + count, with: [], run: list.prepend)
-  |> list.reverse
-}
-
-/// A source that counts up without an end. It sends each demand that it
-/// receives to the probe.
-fn counter_source(demand_probe: Subject(Int)) {
-  source.new(init: 0, on_demand: fn(counter, demand) {
-    process.send(demand_probe, demand)
-    source.emit(count_up(counter, demand), counter + demand)
-  })
-}
-
-/// A sink that sends each batch to the probe, together with a subject.
-/// The test must send a reply on that subject before the sink continues.
-fn lockstep_sink(batch_probe: Subject(#(List(Int), Subject(Nil)))) {
-  sink.new(init: Nil, on_events: fn(_state, events, _subscription) {
-    let step = process.new_subject()
-    process.send(batch_probe, #(events, step))
-    let assert Ok(Nil) = process.receive(step, 10_000)
-    sink.continue(Nil)
-  })
-}
-
-/// Move a lockstep sink forward until the quantity of collected events is
-/// `target`, or until no more events come.
-fn collect_events(
-  batch_probe: Subject(#(List(Int), Subject(Nil))),
-  target: Int,
-  received: List(Int),
-) -> List(Int) {
-  case list.length(received) >= target {
-    True -> received
-    False ->
-      case process.receive(batch_probe, 1000) {
-        Error(Nil) -> received
-        Ok(#(events, step)) -> {
-          process.send(step, Nil)
-          collect_events(batch_probe, target, list.append(received, events))
-        }
-      }
-  }
-}
-
-fn shutdown(started: Started(data)) -> Nil {
-  process.unlink(started.pid)
-  process.kill(started.pid)
-}
+import support
 
 pub fn events_flow_in_order_test() {
   let demand_probe = process.new_subject()
   let batch_probe = process.new_subject()
-  let assert Ok(counter) = counter_source(demand_probe) |> source.start()
-  let assert Ok(collector) = lockstep_sink(batch_probe) |> sink.start()
+  let assert Ok(counter) =
+    support.counter_source_with_probe(demand_probe) |> source.start()
+  let assert Ok(collector) = support.lockstep_sink(batch_probe) |> sink.start()
 
   let assert Ok(_) =
     sluice.subscription(to: counter.data)
@@ -84,17 +35,18 @@ pub fn events_flow_in_order_test() {
       process.send(step, Nil)
       list.append(received, events)
     })
-  assert received == count_up(0, list.length(received))
+  assert received == support.count_up(0, list.length(received))
 
-  shutdown(collector)
-  shutdown(counter)
+  support.shutdown(collector)
+  support.shutdown(counter)
 }
 
 pub fn slow_sink_throttles_source_test() {
   let demand_probe = process.new_subject()
   let batch_probe = process.new_subject()
-  let assert Ok(counter) = counter_source(demand_probe) |> source.start()
-  let assert Ok(collector) = lockstep_sink(batch_probe) |> sink.start()
+  let assert Ok(counter) =
+    support.counter_source_with_probe(demand_probe) |> source.start()
+  let assert Ok(collector) = support.lockstep_sink(batch_probe) |> sink.start()
 
   let assert Ok(_) =
     sluice.subscription(to: counter.data)
@@ -114,8 +66,8 @@ pub fn slow_sink_throttles_source_test() {
   process.send(step, Nil)
   let assert Ok(_) = process.receive(demand_probe, 1000)
 
-  shutdown(collector)
-  shutdown(counter)
+  support.shutdown(collector)
+  support.shutdown(counter)
 }
 
 pub fn overproducing_source_is_capped_by_buffer_and_demand_test() {
@@ -123,10 +75,10 @@ pub fn overproducing_source_is_capped_by_buffer_and_demand_test() {
   // This source emits five times the quantity of the demand.
   let assert Ok(flooder) =
     source.new(init: 0, on_demand: fn(counter, demand) {
-      source.emit(count_up(counter, demand * 5), counter + demand * 5)
+      source.emit(support.count_up(counter, demand * 5), counter + demand * 5)
     })
     |> source.start()
-  let assert Ok(collector) = lockstep_sink(batch_probe) |> sink.start()
+  let assert Ok(collector) = support.lockstep_sink(batch_probe) |> sink.start()
 
   let assert Ok(_) =
     sluice.subscription(to: flooder.data)
@@ -144,10 +96,10 @@ pub fn overproducing_source_is_capped_by_buffer_and_demand_test() {
       process.send(step, Nil)
       list.append(received, events)
     })
-  assert received == count_up(0, list.length(received))
+  assert received == support.count_up(0, list.length(received))
 
-  shutdown(collector)
-  shutdown(flooder)
+  support.shutdown(collector)
+  support.shutdown(flooder)
 }
 
 pub fn emitter_pushes_flow_downstream_test() {
@@ -159,7 +111,7 @@ pub fn emitter_pushes_flow_downstream_test() {
       Ok(Nil)
     })
     |> source.start()
-  let assert Ok(collector) = lockstep_sink(batch_probe) |> sink.start()
+  let assert Ok(collector) = support.lockstep_sink(batch_probe) |> sink.start()
   let assert Ok(emitter) = process.receive(emitter_probe, 1000)
 
   let assert Ok(_) =
@@ -177,11 +129,12 @@ pub fn emitter_pushes_flow_downstream_test() {
 
   // The buffer keeps the pushes that are more than the open demand.
   // They are not lost.
-  source.push(emitter, count_up(4, 10))
-  assert collect_events(batch_probe, 10, []) == count_up(4, 10)
+  source.push(emitter, support.count_up(4, 10))
+  assert support.collect_lockstep_events(batch_probe, 10, [])
+    == support.count_up(4, 10)
 
-  shutdown(collector)
-  shutdown(pushed)
+  support.shutdown(collector)
+  support.shutdown(pushed)
 }
 
 /// Push the events 1..10 into a source buffer that has a limit of 3,
@@ -203,10 +156,10 @@ fn overflow_survivors(keep: sluice.Keep) -> List(Int) {
       state
     })
     |> source.start()
-  let assert Ok(collector) = lockstep_sink(batch_probe) |> sink.start()
+  let assert Ok(collector) = support.lockstep_sink(batch_probe) |> sink.start()
   let assert Ok(emitter) = process.receive(emitter_probe, 1000)
 
-  source.push(emitter, count_up(1, 10))
+  source.push(emitter, support.count_up(1, 10))
   // Ten events went into a buffer with a limit of three: the source
   // reports seven discarded events through the callback.
   let assert Ok(7) = process.receive(discard_probe, 1000)
@@ -221,8 +174,8 @@ fn overflow_survivors(keep: sluice.Keep) -> List(Int) {
   // The buffer kept only these events. No other events come.
   assert process.receive(batch_probe, 100) == Error(Nil)
 
-  shutdown(collector)
-  shutdown(pushed)
+  support.shutdown(collector)
+  support.shutdown(pushed)
   survivors
 }
 
@@ -245,11 +198,11 @@ pub fn hybrid_source_pulls_pushes_and_finishes_test() {
       Ok(0)
     })
     |> source.on_demand(fn(counter, demand) {
-      source.emit(count_up(counter, demand), counter + demand)
+      source.emit(support.count_up(counter, demand), counter + demand)
     })
     |> source.buffer_unbounded()
     |> source.start()
-  let assert Ok(collector) = lockstep_sink(batch_probe) |> sink.start()
+  let assert Ok(collector) = support.lockstep_sink(batch_probe) |> sink.start()
   let assert Ok(emitter) = process.receive(emitter_probe, 1000)
   process.unlink(hybrid.pid)
   let source_monitor = process.monitor(hybrid.pid)
@@ -273,7 +226,7 @@ pub fn hybrid_source_pulls_pushes_and_finishes_test() {
   let assert Ok(process.ProcessDown(_, _, process.Normal)) =
     process.selector_receive(down_selector, 2000)
 
-  shutdown(collector)
+  support.shutdown(collector)
 }
 
 pub fn finite_source_stops_and_permanent_sink_follows_test() {
@@ -286,7 +239,7 @@ pub fn finite_source_stops_and_permanent_sink_follows_test() {
         True -> source.stop()
         False -> {
           let count = int.min(demand, 10 - emitted)
-          source.emit(count_up(emitted, count), emitted + count)
+          source.emit(support.count_up(emitted, count), emitted + count)
         }
       }
     })
@@ -321,7 +274,7 @@ pub fn finite_source_stops_and_permanent_sink_follows_test() {
 
 pub fn subscribe_validation_test() {
   let assert Ok(counter) =
-    counter_source(process.new_subject()) |> source.start()
+    support.counter_source_with_probe(process.new_subject()) |> source.start()
   let assert Ok(collector) =
     sink.new(init: Nil, on_events: fn(state, _events, _subscription) {
       sink.continue(state)
@@ -345,30 +298,30 @@ pub fn subscribe_validation_test() {
     |> sluice.subscribe(consumer: collector.data)
     == Error(sluice.AlreadySubscribed)
 
-  shutdown(collector)
-  shutdown(counter)
+  support.shutdown(collector)
+  support.shutdown(counter)
 }
 
 pub fn subscribe_to_dead_stages_test() {
   let assert Ok(counter) =
-    counter_source(process.new_subject()) |> source.start()
+    support.counter_source_with_probe(process.new_subject()) |> source.start()
   let assert Ok(collector) =
     sink.new(init: Nil, on_events: fn(state, _events, _subscription) {
       sink.continue(state)
     })
     |> sink.start()
 
-  shutdown(counter)
+  support.shutdown(counter)
   assert sluice.subscription(to: counter.data)
     |> sluice.subscribe(consumer: collector.data)
     == Error(sluice.ProducerNotAlive)
 
-  shutdown(collector)
+  support.shutdown(collector)
   let assert Ok(replacement) =
-    counter_source(process.new_subject()) |> source.start()
+    support.counter_source_with_probe(process.new_subject()) |> source.start()
   assert sluice.subscription(to: replacement.data)
     |> sluice.subscribe(consumer: collector.data)
     == Error(sluice.ConsumerNotAlive)
 
-  shutdown(replacement)
+  support.shutdown(replacement)
 }

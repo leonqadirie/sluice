@@ -10,6 +10,7 @@ import sluice/internal/buffer
 import sluice/internal/dispatcher.{type Dispatcher, Delivery}
 import sluice/internal/producer_core
 import sluice/internal/protocol.{type ConsumerMessage}
+import support
 
 fn subscriber() -> Subject(ConsumerMessage(Int)) {
   process.new_subject()
@@ -137,11 +138,6 @@ pub fn dispatch_preserves_event_order_across_subscribers_test() {
   assert list.sort(all_events, by: int.compare) == [1, 2, 3, 4]
 }
 
-fn count_up(from: Int, count: Int) -> List(Int) {
-  int.range(from: from, to: from + count, with: [], run: list.prepend)
-  |> list.reverse
-}
-
 // A new subscriber must receive buffered events, also when the demand
 // from a cancelled subscriber absorbs its full first ask. The test drives
 // the producer runtime directly and examines the outbound messages that
@@ -175,7 +171,7 @@ pub fn absorbed_ask_still_drains_buffer_test() {
 
   // Ten events arrive while there is no subscriber: all go to the buffer.
   let producer_core.EmitResult(core:, discarded:, ..) =
-    producer_core.emit(core:, events: count_up(1, 10))
+    producer_core.emit(core:, events: support.count_up(1, 10))
   assert discarded == 0
 
   // The second subscriber asks for six events. The pending demand absorbs

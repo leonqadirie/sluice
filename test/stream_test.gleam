@@ -2,22 +2,11 @@
 
 import gleam/erlang/process
 import gleam/int
-import gleam/list
-import gleam/otp/actor.{type Started}
 import gleam/yielder
 import sluice
 import sluice/sink
 import sluice/source
-
-fn count_up(from: Int, count: Int) -> List(Int) {
-  int.range(from: from, to: from + count, with: [], run: list.prepend)
-  |> list.reverse
-}
-
-fn shutdown(started: Started(data)) -> Nil {
-  process.unlink(started.pid)
-  process.kill(started.pid)
-}
+import support
 
 // A yielder source delivers the full sequence and then stops with the
 // normal reason.
@@ -52,7 +41,7 @@ pub fn yielder_source_delivers_and_stops_test() {
   let assert Ok(process.ProcessDown(_, _, process.Normal)) =
     process.selector_receive(down_selector, 2000)
 
-  shutdown(collector)
+  support.shutdown(collector)
 }
 
 // A source can emit its last events and stop in one step.
@@ -86,12 +75,12 @@ pub fn emit_final_delivers_and_stops_test() {
   let assert Ok(process.ProcessDown(_, _, process.Normal)) =
     process.selector_receive(down_selector, 2000)
 
-  shutdown(collector)
+  support.shutdown(collector)
 }
 
 pub fn fold_returns_the_final_value_test() {
   let assert Ok(numbers) =
-    source.from_yielder(yielder.from_list(count_up(1, 100)))
+    source.from_yielder(yielder.from_list(support.count_up(1, 100)))
     |> source.start()
   process.unlink(numbers.pid)
 
@@ -102,7 +91,7 @@ pub fn fold_returns_the_final_value_test() {
 pub fn fold_reports_a_timeout_test() {
   let assert Ok(counter) =
     source.new(init: 0, on_demand: fn(counter, demand) {
-      source.emit(count_up(counter, demand), counter + demand)
+      source.emit(support.count_up(counter, demand), counter + demand)
     })
     |> source.start()
 
@@ -115,7 +104,7 @@ pub fn fold_reports_a_timeout_test() {
     )
   assert result == Error(sink.FoldTimeout)
 
-  shutdown(counter)
+  support.shutdown(counter)
 }
 
 pub fn fold_reports_a_producer_failure_test() {
