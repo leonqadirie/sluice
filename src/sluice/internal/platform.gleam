@@ -12,6 +12,11 @@ pub fn send_named(name: Name(message), message: message) -> Nil
 @external(erlang, "sluice_ffi", "log_warning")
 pub fn log_warning(message: String) -> Nil
 
+/// Run a function and report the success. A failure inside the function
+/// does not stop the caller.
+@external(erlang, "sluice_ffi", "safely")
+pub fn safely(run: fn() -> Nil) -> Bool
+
 /// A monotonic clock for timeout deadlines, in milliseconds.
 @external(erlang, "sluice_ffi", "monotonic_milliseconds")
 pub fn monotonic_milliseconds() -> Int

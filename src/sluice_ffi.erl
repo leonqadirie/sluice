@@ -1,5 +1,5 @@
 -module(sluice_ffi).
--export([send_named/2, log_warning/1, monotonic_milliseconds/0]).
+-export([send_named/2, log_warning/1, safely/1, monotonic_milliseconds/0]).
 
 %% Send a message to a registered name. A send to a bare pid can not fail,
 %% also when the pid is dead. Thus this function first changes the name
@@ -18,6 +18,16 @@ send_named(Name, Message) ->
 log_warning(Message) ->
     logger:warning(Message),
     nil.
+
+%% Run a function and report the success. A pool worker uses this: a
+%% failure in the work function must not remove the completion signal.
+safely(Run) ->
+    try
+        Run(),
+        true
+    catch
+        _Class:_Reason -> false
+    end.
 
 %% A clock for timeout deadlines. Unlike wall time, it never moves
 %% backwards or jumps when the system clock changes.

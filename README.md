@@ -263,6 +263,26 @@ You can also cancel a subscription with `sluice.cancel`. Each `on_events`
 callback receives its `Subscription`. Thus a stage can disconnect itself
 while events move.
 
+## Process events in parallel
+
+`pool.sink` makes a sink that runs each event in a separate worker
+process, with a limit on the quantity of parallel workers. The demand
+follows the workers: the pool asks for one more event when a worker
+completes. Subscribe it with the `Manual` demand mode; the pool makes its
+own asks. A failure in a worker does not stop the pool:
+
+```gleam
+import sluice/pool
+
+let assert Ok(deliveries) =
+  pool.sink(concurrency: 8, run: fn(order) { deliver(order) })
+  |> sink.start()
+let assert Ok(_) =
+  sluice.subscription(to: orders.data)
+  |> sluice.demand_mode(sluice.Manual)
+  |> sluice.subscribe(consumer: deliveries.data)
+```
+
 ## Yielders and folds
 
 `source.from_yielder` makes a source from a yielder; the source stops
