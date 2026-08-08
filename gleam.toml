@@ -6,6 +6,41 @@ repository = { type = "github", user = "leonqadirie", repo = "sluice" }
 gleam = ">= 1.18.0"
 target = "erlang"
 
+[[documentation.pages]]
+title = "Demand and buffers"
+path = "demand.html"
+source = "./docs/demand.md"
+
+[[documentation.pages]]
+title = "Fan out and fan in"
+path = "fan-out.html"
+source = "./docs/fan-out.md"
+
+[[documentation.pages]]
+title = "Sources and sinks in practice"
+path = "sources-and-sinks.html"
+source = "./docs/sources-and-sinks.md"
+
+[[documentation.pages]]
+title = "Control demand yourself"
+path = "manual-demand.html"
+source = "./docs/manual-demand.md"
+
+[[documentation.pages]]
+title = "Process events in parallel"
+path = "parallel.html"
+source = "./docs/parallel.md"
+
+[[documentation.pages]]
+title = "Supervision"
+path = "supervision.html"
+source = "./docs/supervision.md"
+
+[[documentation.pages]]
+title = "Defaults and timeouts"
+path = "defaults.html"
+source = "./docs/defaults.md"
+
 [dependencies]
 gleam_stdlib = ">= 1.0.0 and < 2.0.0"
 gleam_erlang = ">= 1.3.0 and < 2.0.0"
