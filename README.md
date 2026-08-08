@@ -477,6 +477,39 @@ Use `Permanent` subscriptions with `RestForOne`. When a source stops, its
 consumers stop with it, the supervisor restarts the later stages in
 order, and each stage reconnects through the names.
 
+A consumer supervisor joins the tree the same way. Give it a name with
+`consumer_supervisor.new_name`, declare its subscription on the builder
+with `consumer_supervisor.subscribe`, and add it as a worker child:
+
+```gleam
+pub fn start_deliveries() {
+  let orders_name = source.new_name("orders")
+  let deliveries_name = consumer_supervisor.new_name("deliveries")
+
+  supervisor.new(supervisor.RestForOne)
+  |> supervisor.add(
+    supervision.worker(fn() {
+      order_source() |> source.named(orders_name) |> source.start()
+    }),
+  )
+  |> supervisor.add(
+    supervision.worker(fn() {
+      consumer_supervisor.new(start_delivery)
+      |> consumer_supervisor.named(deliveries_name)
+      |> consumer_supervisor.subscribe(
+        sluice.subscription(to: source.outlet_of(orders_name)),
+      )
+      |> consumer_supervisor.start()
+    }),
+  )
+  |> supervisor.start()
+}
+```
+
+The two supervisors do different jobs: the static supervisor restarts
+the stages of the pipeline, and the consumer supervisor restarts its
+own children, one for each event.
+
 ## Design notes
 
 - A consumer can hold at most one subscription per producer. A second
