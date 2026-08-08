@@ -83,7 +83,15 @@ pub fn add_subscription(
   tag_down tag_down: fn(Subject(ConsumerMessage(event)), Down) -> message,
   make_cancel make_cancel: fn(Subject(ConsumerMessage(event))) -> fn() -> Nil,
   make_ask make_ask: fn(Subject(ConsumerMessage(event))) -> fn(Int) -> Nil,
-) -> Result(#(Core(event), Selector(message), Subscription), SubscribeError) {
+) -> Result(
+  #(
+    Core(event),
+    Selector(message),
+    Subject(ConsumerMessage(event)),
+    Subscription,
+  ),
+  SubscribeError,
+) {
   // The runtime subscribe path checks the demand values before it sends
   // the request. This check also covers the declared subscriptions,
   // which do not go through that path.
@@ -142,7 +150,7 @@ pub fn add_subscription(
   }
   let core =
     Core(subscriptions: dict.insert(core.subscriptions, subject, subscription))
-  Ok(#(core, selector, handle))
+  Ok(#(core, selector, subject, handle))
 }
 
 fn activate(
@@ -396,7 +404,7 @@ pub fn request_demand(
 pub fn confirm(
   core core: Core(event),
   reply reply: Subject(Result(Subscription, SubscribeError)),
-) -> #(Core(event), Option(Subscription)) {
+) -> #(Core(event), Option(#(Subject(ConsumerMessage(event)), Subscription))) {
   case find_by_reply(core, reply) {
     Error(Nil) -> #(core, None)
     Ok(subscription) -> {
@@ -405,7 +413,10 @@ pub fn confirm(
           SubscriptionState(..subscription, reply: None),
           subscription.metadata,
         )
-      #(store(core, subscription), Some(subscription.handle))
+      #(
+        store(core, subscription),
+        Some(#(subscription.subject, subscription.handle)),
+      )
     }
   }
 }
