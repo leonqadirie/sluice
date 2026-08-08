@@ -18,6 +18,8 @@ pub type ProducerMessage(event) {
   )
   Ask(from: Subject(ConsumerMessage(event)), demand: Int)
   Cancel(from: Subject(ConsumerMessage(event)))
+  /// End the accumulation of demand on a source.
+  ForwardDemand
 }
 
 /// The messages that a consumer face receives from the producer, on the

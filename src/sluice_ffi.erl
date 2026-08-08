@@ -1,5 +1,5 @@
 -module(sluice_ffi).
--export([send_named/2, log_warning/1]).
+-export([send_named/2, log_warning/1, monotonic_milliseconds/0]).
 
 %% Send a message to a registered name. A send to a bare pid can not fail,
 %% also when the pid is dead. Thus this function first changes the name
@@ -18,3 +18,8 @@ send_named(Name, Message) ->
 log_warning(Message) ->
     logger:warning(Message),
     nil.
+
+%% A clock for timeout deadlines. Unlike wall time, it never moves
+%% backwards or jumps when the system clock changes.
+monotonic_milliseconds() ->
+    erlang:monotonic_time(millisecond).

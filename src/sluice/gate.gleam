@@ -9,6 +9,7 @@ import gleam/int
 import gleam/list
 import gleam/option.{type Option, None, Some}
 import gleam/otp/actor
+import gleam/result
 import gleam/string
 import sluice.{
   type Inlet, type Keep, type Outlet, type Subscription,
@@ -125,6 +126,7 @@ pub opaque type Builder(state, in, out) {
     on_discard: fn(state, Int) -> state,
     messages: Option(fn() -> Selector(Message(state, in, out))),
     dispatcher: Dispatcher(out),
+    on_subscribers: fn(state, sluice.SubscriberChange) -> state,
   )
 }
 
@@ -146,6 +148,7 @@ pub fn new(
     on_discard: default_on_discard,
     messages: None,
     dispatcher: dispatcher.demand(),
+    on_subscribers: fn(state, _change) { state },
   )
 }
 
@@ -167,6 +170,15 @@ pub fn on_discard(
   on_discard: fn(state, Int) -> state,
 ) -> Builder(state, in, out) {
   Builder(..builder, on_discard:)
+}
+
+/// Set a hook that runs when a subscriber arrives at the gate or leaves
+/// it.
+pub fn on_subscribers(
+  builder: Builder(state, in, out),
+  on_subscribers: fn(state, sluice.SubscriberChange) -> state,
+) -> Builder(state, in, out) {
+  Builder(..builder, on_subscribers:)
 }
 
 /// Set the dispatcher of the gate. The default is the demand dispatcher.
@@ -210,8 +222,11 @@ pub fn start_timeout(
   Builder(..builder, start_timeout: int.max(milliseconds, 1))
 }
 
-/// Declare a subscription. The gate makes the connection during its start.
-/// If the connection is not possible, the start fails.
+/// Declare a subscription. The gate makes the connection during its
+/// start. The start fails for the checks that the gate can make itself:
+/// a dead producer, a duplicate, a subscription to itself, and demand
+/// values that are not correct. A refusal from the dispatcher of the
+/// producer comes later as an abnormal end of the subscription.
 pub fn subscribe(
   builder builder: Builder(state, in, out),
   options options: SubscriptionOptions(in),
@@ -267,6 +282,7 @@ type State(state, in, out) {
     control_subject: Subject(sluice.ConsumerControl(in)),
     on_events: fn(state, List(in), Subscription) -> Transform(state, out),
     on_discard: fn(state, Int) -> state,
+    on_subscribers: fn(state, sluice.SubscriberChange) -> state,
   )
 }
 
@@ -299,7 +315,55 @@ fn initialise(
     process.new_selector()
     |> process.select_map(control_subject, Control)
     |> process.select_map(producer_subject, FromDownstream)
-  let selector = case builder.name {
+  use selector <- result.try(select_name(builder, selector))
+  let selector = case builder.messages {
+    None -> selector
+    Some(install) -> process.merge_selector(selector, install())
+  }
+  let gate =
+    Gate(
+      inlet: sluice.make_inlet(
+        fn(control) { process.send(control_subject, control) },
+        fn() { process.subject_owner(control_subject) },
+      ),
+      outlet: sluice.make_outlet(
+        protocol.ProducerHandle(
+          send: fn(message) { process.send(producer_subject, message) },
+          owner: fn() { process.subject_owner(producer_subject) },
+        ),
+      ),
+    )
+  let state =
+    State(
+      user_state: builder.state,
+      consumer: consumer_core.new(),
+      producer: producer_core.new(
+        dispatcher.build(builder.dispatcher),
+        buffer.new(builder.capacity, builder.keep),
+      ),
+      selector:,
+      control_subject:,
+      on_events: builder.on_events,
+      on_discard: builder.on_discard,
+      on_subscribers: builder.on_subscribers,
+    )
+  use state <- result.try(establish_declared(
+    state,
+    list.reverse(builder.subscriptions),
+  ))
+  actor.initialised(state)
+  |> actor.selecting(state.selector)
+  |> actor.returning(gate)
+  |> Ok
+}
+
+// Add the registered name to the selector, when the gate has one.
+// nolint: stringly_typed_error -- feeds the actor initialiser, which requires String errors
+fn select_name(
+  builder: Builder(state, in, out),
+  selector: Selector(Message(state, in, out)),
+) -> Result(Selector(Message(state, in, out)), String) {
+  case builder.name {
     None -> Ok(selector)
     Some(name) ->
       case process.register(process.self(), name.name) {
@@ -319,49 +383,6 @@ fn initialise(
           )
       }
   }
-  case selector {
-    Error(reason) -> Error(reason)
-    Ok(selector) -> {
-      let selector = case builder.messages {
-        None -> selector
-        Some(install) -> process.merge_selector(selector, install())
-      }
-      let gate =
-        Gate(
-          inlet: sluice.make_inlet(
-            fn(control) { process.send(control_subject, control) },
-            fn() { process.subject_owner(control_subject) },
-          ),
-          outlet: sluice.make_outlet(
-            protocol.ProducerHandle(
-              send: fn(message) { process.send(producer_subject, message) },
-              owner: fn() { process.subject_owner(producer_subject) },
-            ),
-          ),
-        )
-      let state =
-        State(
-          user_state: builder.state,
-          consumer: consumer_core.new(),
-          producer: producer_core.new(
-            dispatcher.build(builder.dispatcher),
-            buffer.new(builder.capacity, builder.keep),
-          ),
-          selector:,
-          control_subject:,
-          on_events: builder.on_events,
-          on_discard: builder.on_discard,
-        )
-      case establish_declared(state, list.reverse(builder.subscriptions)) {
-        Error(reason) -> Error(reason)
-        Ok(state) ->
-          actor.initialised(state)
-          |> actor.selecting(state.selector)
-          |> actor.returning(gate)
-          |> Ok
-      }
-    }
-  }
 }
 
 // nolint: stringly_typed_error -- feeds the actor initialiser, which requires String errors
@@ -372,8 +393,14 @@ fn establish_declared(
   case subscriptions {
     [] -> Ok(state)
     [options, ..remaining] -> {
-      let #(producer, min_demand, max_demand, cancel, metadata, mode) =
-        sluice.options_fields(options)
+      let sluice.OptionsFields(
+        producer:,
+        min_demand:,
+        max_demand:,
+        cancel:,
+        metadata:,
+        mode:,
+      ) = sluice.options_fields(options)
       case
         consumer_core.add_subscription(
           state.consumer,
@@ -384,6 +411,7 @@ fn establish_declared(
           cancel:,
           mode:,
           metadata:,
+          reply: option.None,
           tag_message: FromUpstream,
           tag_down: UpstreamDown,
           make_cancel: cancel_closure(state.control_subject),
@@ -440,6 +468,7 @@ fn handle_message(
           cancel:,
           mode:,
           metadata:,
+          reply: option.Some(reply),
           tag_message: FromUpstream,
           tag_down: UpstreamDown,
           make_cancel: cancel_closure(state.control_subject),
@@ -464,6 +493,25 @@ fn handle_message(
         consumer_core.request_demand(core: state.consumer, subject:, demand:)
       actor.continue(State(..state, consumer:))
     }
+    Control(sluice.ConfirmSubscribe(reply, confirmed, deadline)) -> {
+      let #(consumer, selector) = case
+        platform.monotonic_milliseconds() < deadline
+      {
+        True -> {
+          let #(consumer, _handle) =
+            consumer_core.confirm(core: state.consumer, reply:)
+          #(consumer, state.selector)
+        }
+        False -> consumer_core.abandon(state.consumer, state.selector, reply)
+      }
+      process.send(confirmed, Nil)
+      continue_with(State(..state, consumer:, selector:))
+    }
+    Control(sluice.AbandonSubscribe(reply)) -> {
+      let #(consumer, selector) =
+        consumer_core.abandon(state.consumer, state.selector, reply)
+      continue_with(State(..state, consumer:, selector:))
+    }
     FromUpstream(subject, protocol.NewEvents(events)) ->
       transform(state: state, subject: subject, events: events)
     FromUpstream(subject, protocol.Cancelled(reason)) ->
@@ -479,6 +527,7 @@ fn handle_message(
         process.PortDown(..) -> actor.continue(state)
       }
     FromDownstream(protocol.Subscribe(from, metadata)) -> {
+      let before = producer_core.subscriber_count(state.producer)
       let #(producer, selector, outbound) =
         producer_core.on_subscribe(
           state.producer,
@@ -488,7 +537,16 @@ fn handle_message(
           SubscriberDown,
         )
       producer_core.send_all(outbound)
-      continue_with(State(..state, producer:, selector:))
+      let count = producer_core.subscriber_count(producer)
+      let user_state = case count > before {
+        True ->
+          state.on_subscribers(
+            state.user_state,
+            sluice.SubscriberArrived(count),
+          )
+        False -> state.user_state
+      }
+      continue_with(State(..state, producer:, selector:, user_state:))
     }
     FromDownstream(protocol.Ask(from, demand)) -> {
       // A gate does not make events on demand. It is sufficient to record
@@ -506,6 +564,8 @@ fn handle_message(
       }
       actor.continue(State(..state, producer:, consumer:))
     }
+    // A gate does not accumulate demand: it ignores this call.
+    FromDownstream(protocol.ForwardDemand) -> actor.continue(state)
     FromDownstream(protocol.Cancel(from)) ->
       subscriber_gone(state:, from:, acknowledge: True)
     SubscriberDown(from, _down) ->
@@ -513,8 +573,12 @@ fn handle_message(
     FromUser(apply) ->
       case apply(state.user_state) {
         Emit(produced, user_state) -> {
-          let producer_core.EmitResult(core: producer, outbound:, discarded:) =
-            producer_core.emit(state.producer, produced)
+          let producer_core.EmitResult(
+            core: producer,
+            outbound:,
+            discarded:,
+            ..,
+          ) = producer_core.emit(state.producer, produced)
           producer_core.send_all(outbound)
           let user_state = case discarded > 0 {
             True -> state.on_discard(user_state, discarded)
@@ -545,8 +609,15 @@ fn transform(
         let #(user_state, producer) = folded
         case on_events(user_state, batch, subscription) {
           Emit(produced, user_state) -> {
-            let producer_core.EmitResult(core: producer, outbound:, discarded:) =
-              producer_core.emit(producer, produced)
+            // A gate does not make events on demand: the replacement
+            // demand from filters stays recorded until new upstream
+            // events arrive.
+            let producer_core.EmitResult(
+              core: producer,
+              outbound:,
+              discarded:,
+              ..,
+            ) = producer_core.emit(producer, produced)
             producer_core.send_all(outbound)
             let user_state = case discarded > 0 {
               True -> on_discard(user_state, discarded)
@@ -599,9 +670,16 @@ fn subscriber_gone(
   from from: Subject(ConsumerMessage(out)),
   acknowledge acknowledge: Bool,
 ) -> actor.Next(State(state, in, out), Message(state, in, out)) {
+  let before = producer_core.subscriber_count(state.producer)
   let producer_core.CancelResult(core: producer, selector:, outbound:, ..) =
     producer_core.on_cancel(state.producer, state.selector, from, acknowledge:)
   producer_core.send_all(outbound)
+  let count = producer_core.subscriber_count(producer)
+  let user_state = case count < before {
+    True -> state.on_subscribers(state.user_state, sluice.SubscriberLeft(count))
+    False -> state.user_state
+  }
+  let state = State(..state, user_state:)
   let appetite =
     producer_core.has_demand(producer)
     || producer_core.buffer_is_empty(producer)

@@ -7,6 +7,7 @@ import gleam/int
 import gleam/list
 import gleam/option.{type Option, None, Some}
 import gleam/otp/actor
+import gleam/result
 import gleam/string
 import sluice.{type Inlet, type Subscription, type SubscriptionOptions}
 import sluice/internal/consumer_core
@@ -34,6 +35,77 @@ pub fn stop() -> Next(state) {
 
 pub fn stop_abnormal(reason: String) -> Next(state) {
   StopAbnormal(reason)
+}
+
+/// The result of a `fold` that did not complete.
+pub type FoldError {
+  /// The internal sink did not start.
+  FoldDidNotStart
+  /// The subscription to the outlet was not possible.
+  FoldDidNotSubscribe(reason: sluice.SubscribeError)
+  /// The producer failed before the end of the flow.
+  FoldProducerFailed(reason: String)
+  /// The producer did not stop in the given time.
+  FoldTimeout
+}
+
+/// Run the full flow of an outlet through a fold, and return the final
+/// value when the producer stops. Use it together with `from_yielder` or
+/// an other source that has an end. The wait has a limit of `within`
+/// milliseconds.
+pub fn fold(
+  from outlet: sluice.Outlet(event),
+  initial initial: accumulated,
+  with combine: fn(accumulated, event) -> accumulated,
+  within timeout: Int,
+) -> Result(accumulated, FoldError) {
+  let reply = process.new_subject()
+  let builder =
+    new(init: initial, on_events: fn(accumulated, events, _subscription) {
+      Continue(list.fold(events, accumulated, combine))
+    })
+    |> on_cancelled(fn(accumulated, end) {
+      let result = case end {
+        sluice.ProducerStopped -> Ok(accumulated)
+        sluice.ProducerFailed(reason) -> Error(FoldProducerFailed(reason))
+      }
+      process.send(reply, result)
+      Stop
+    })
+  case start(builder) {
+    Error(_) -> Error(FoldDidNotStart)
+    Ok(folder) -> wait_for_fold(folder:, outlet:, reply:, timeout:)
+  }
+}
+
+fn wait_for_fold(
+  folder folder: actor.Started(Inlet(event)),
+  outlet outlet: sluice.Outlet(event),
+  reply reply: Subject(Result(accumulated, FoldError)),
+  timeout timeout: Int,
+) -> Result(accumulated, FoldError) {
+  let subscribed =
+    sluice.subscription(to: outlet)
+    |> sluice.subscribe(consumer: folder.data)
+  case subscribed {
+    Error(error) -> {
+      stop_folder(folder)
+      Error(FoldDidNotSubscribe(error))
+    }
+    Ok(_) ->
+      case process.receive(reply, timeout) {
+        Ok(result) -> result
+        Error(Nil) -> {
+          stop_folder(folder)
+          Error(FoldTimeout)
+        }
+      }
+  }
+}
+
+fn stop_folder(folder: actor.Started(Inlet(event))) -> Nil {
+  process.unlink(folder.pid)
+  process.kill(folder.pid)
 }
 
 /// A permanent name for a sink. Make the name with `new_name`. Attach it
@@ -68,6 +140,8 @@ pub opaque type Builder(state, event) {
     subscriptions: List(SubscriptionOptions(event)),
     start_timeout: Int,
     messages: Option(fn() -> Selector(Message(state, event))),
+    on_subscribed: fn(state, Subscription) -> Next(state),
+    on_cancelled: Option(fn(state, sluice.SubscriptionEnd) -> Next(state)),
   )
 }
 
@@ -84,18 +158,44 @@ pub fn new(
     subscriptions: [],
     start_timeout: 5000,
     messages: None,
+    on_subscribed: fn(state, _subscription) { Continue(state) },
+    on_cancelled: None,
   )
 }
 
-/// Declare a subscription. The sink makes the connection during its start.
-/// If the connection is not possible, the start fails. Under a supervisor,
-/// the restart sequence then does the retry. Use this together with
-/// `outlet_of` names for connections that continue through restarts.
+/// Declare a subscription. The sink makes the connection during its
+/// start. The start fails for the checks that the sink can make itself:
+/// a dead producer, a duplicate, a subscription to itself, and demand
+/// values that are not correct. Under a supervisor, the restart sequence
+/// then does the retry. A refusal from the dispatcher of the producer,
+/// for example a missing partition, comes later as an abnormal end of
+/// the subscription. Use this together with `outlet_of` names for
+/// connections that continue through restarts.
 pub fn subscribe(
   builder builder: Builder(state, event),
   options options: SubscriptionOptions(event),
 ) -> Builder(state, event) {
   Builder(..builder, subscriptions: [options, ..builder.subscriptions])
+}
+
+/// Set a hook that runs when the sink establishes a subscription. The
+/// hook receives the new `Subscription`, so a sink with manual demand can
+/// make its first ask here.
+pub fn on_subscribed(
+  builder: Builder(state, event),
+  on_subscribed: fn(state, Subscription) -> Next(state),
+) -> Builder(state, event) {
+  Builder(..builder, on_subscribed:)
+}
+
+/// Set a hook that runs when a subscription of the sink ends. When this
+/// hook is set, it decides what the sink does, and the cancel mode of the
+/// subscription does not apply.
+pub fn on_cancelled(
+  builder: Builder(state, event),
+  on_cancelled: fn(state, sluice.SubscriptionEnd) -> Next(state),
+) -> Builder(state, event) {
+  Builder(..builder, on_cancelled: Some(on_cancelled))
 }
 
 /// Give the sink a private message channel with a type of your choice.
@@ -155,6 +255,8 @@ type State(state, event) {
     selector: Selector(Message(state, event)),
     control_subject: Subject(sluice.ConsumerControl(event)),
     on_events: fn(state, List(event), Subscription) -> Next(state),
+    on_subscribed: fn(state, Subscription) -> Next(state),
+    on_cancelled: Option(fn(state, sluice.SubscriptionEnd) -> Next(state)),
   )
 }
 
@@ -177,7 +279,39 @@ fn initialise(
   actor.Initialised(State(state, event), Message(state, event), Inlet(event)),
   String,
 ) {
-  let faces = case builder.name {
+  use #(control_subject, inlet) <- result.try(select_faces(builder))
+  let selector =
+    process.new_selector() |> process.select_map(control_subject, Control)
+  let selector = case builder.messages {
+    None -> selector
+    Some(install) -> process.merge_selector(selector, install())
+  }
+  let state =
+    State(
+      user_state: builder.state,
+      core: consumer_core.new(),
+      selector:,
+      control_subject:,
+      on_events: builder.on_events,
+      on_subscribed: builder.on_subscribed,
+      on_cancelled: builder.on_cancelled,
+    )
+  use state <- result.try(establish_declared(
+    state,
+    list.reverse(builder.subscriptions),
+  ))
+  actor.initialised(state)
+  |> actor.selecting(state.selector)
+  |> actor.returning(inlet)
+  |> Ok
+}
+
+// The control face of the sink: a plain subject, or the registered name.
+// nolint: stringly_typed_error -- feeds the actor initialiser, which requires String errors
+fn select_faces(
+  builder: Builder(state, event),
+) -> Result(#(Subject(sluice.ConsumerControl(event)), Inlet(event)), String) {
+  case builder.name {
     None -> {
       let control_subject = process.new_subject()
       let inlet =
@@ -193,33 +327,6 @@ fn initialise(
         Ok(Nil) -> Ok(#(process.named_subject(name.name), inlet_of(name)))
       }
   }
-  case faces {
-    Error(reason) -> Error(reason)
-    Ok(#(control_subject, inlet)) -> {
-      let selector =
-        process.new_selector() |> process.select_map(control_subject, Control)
-      let selector = case builder.messages {
-        None -> selector
-        Some(install) -> process.merge_selector(selector, install())
-      }
-      let state =
-        State(
-          user_state: builder.state,
-          core: consumer_core.new(),
-          selector:,
-          control_subject:,
-          on_events: builder.on_events,
-        )
-      case establish_declared(state, list.reverse(builder.subscriptions)) {
-        Error(reason) -> Error(reason)
-        Ok(state) ->
-          actor.initialised(state)
-          |> actor.selecting(state.selector)
-          |> actor.returning(inlet)
-          |> Ok
-      }
-    }
-  }
 }
 
 // nolint: stringly_typed_error -- feeds the actor initialiser, which requires String errors
@@ -230,8 +337,14 @@ fn establish_declared(
   case subscriptions {
     [] -> Ok(state)
     [options, ..remaining] -> {
-      let #(producer, min_demand, max_demand, cancel, metadata, mode) =
-        sluice.options_fields(options)
+      let sluice.OptionsFields(
+        producer:,
+        min_demand:,
+        max_demand:,
+        cancel:,
+        metadata:,
+        mode:,
+      ) = sluice.options_fields(options)
       case
         consumer_core.add_subscription(
           state.core,
@@ -242,6 +355,7 @@ fn establish_declared(
           cancel:,
           mode:,
           metadata:,
+          reply: option.None,
           tag_message: FromUpstream,
           tag_down: ProducerDown,
           make_cancel: cancel_closure(state.control_subject),
@@ -249,10 +363,26 @@ fn establish_declared(
         )
       {
         Error(error) -> Error("could not subscribe: " <> string.inspect(error))
-        Ok(#(core, selector, _handle)) ->
-          establish_declared(State(..state, core:, selector:), remaining)
+        Ok(#(core, selector, handle)) -> {
+          let state = State(..state, core:, selector:)
+          declared_subscribed(state:, handle:, remaining:)
+        }
       }
     }
+  }
+}
+
+// nolint: stringly_typed_error -- feeds the actor initialiser, which requires String errors
+fn declared_subscribed(
+  state state: State(state, event),
+  handle handle: Subscription,
+  remaining remaining: List(SubscriptionOptions(event)),
+) -> Result(State(state, event), String) {
+  case state.on_subscribed(state.user_state, handle) {
+    Continue(user_state) ->
+      establish_declared(State(..state, user_state:), remaining)
+    Stop -> Error("the sink stopped in on_subscribed")
+    StopAbnormal(reason) -> Error(reason)
   }
 }
 
@@ -298,6 +428,7 @@ fn handle_message(
           cancel:,
           mode:,
           metadata:,
+          reply: option.Some(reply),
           tag_message: FromUpstream,
           tag_down: ProducerDown,
           make_cancel: cancel_closure(state.control_subject),
@@ -322,6 +453,37 @@ fn handle_message(
       let core =
         consumer_core.request_demand(core: state.core, subject:, demand:)
       actor.continue(State(..state, core:))
+    }
+    Control(sluice.ConfirmSubscribe(reply, confirmed, deadline)) -> {
+      let #(core, selector, handle) = case
+        platform.monotonic_milliseconds() < deadline
+      {
+        True -> {
+          let #(core, handle) = consumer_core.confirm(core: state.core, reply:)
+          #(core, state.selector, handle)
+        }
+        False -> {
+          let #(core, selector) =
+            consumer_core.abandon(state.core, state.selector, reply)
+          #(core, selector, None)
+        }
+      }
+      let state = State(..state, core:, selector:)
+      case handle {
+        None -> {
+          process.send(confirmed, Nil)
+          continue_with(state)
+        }
+        Some(handle) -> {
+          process.send(confirmed, Nil)
+          apply_next(state, state.on_subscribed(state.user_state, handle))
+        }
+      }
+    }
+    Control(sluice.AbandonSubscribe(reply)) -> {
+      let #(core, selector) =
+        consumer_core.abandon(state.core, state.selector, reply)
+      continue_with(State(..state, core:, selector:))
     }
     FromUpstream(subject, protocol.NewEvents(events)) -> {
       let #(core, user_state, outcome) =
@@ -352,12 +514,18 @@ fn handle_message(
           )
         process.PortDown(..) -> actor.continue(state)
       }
-    FromUser(apply) ->
-      case apply(state.user_state) {
-        Continue(user_state) -> actor.continue(State(..state, user_state:))
-        Stop -> actor.stop()
-        StopAbnormal(reason) -> actor.stop_abnormal(reason)
-      }
+    FromUser(apply) -> apply_next(state, apply(state.user_state))
+  }
+}
+
+fn apply_next(
+  state: State(state, event),
+  next: Next(state),
+) -> actor.Next(State(state, event), Message(state, event)) {
+  case next {
+    Continue(user_state) -> continue_with(State(..state, user_state:))
+    Stop -> actor.stop()
+    StopAbnormal(reason) -> actor.stop_abnormal(reason)
   }
 }
 
@@ -382,10 +550,26 @@ fn subscription_closed(
   let #(core, selector, outcome) =
     consumer_core.closed(state.core, state.selector, subject, reason)
   let state = State(..state, core:, selector:)
-  case outcome {
-    consumer_core.KeepRunning -> continue_with(state)
-    consumer_core.StopNormal -> actor.stop()
-    consumer_core.StopAbnormal(reason) -> actor.stop_abnormal(reason)
+  case state.on_cancelled {
+    Some(on_cancelled) ->
+      apply_next(
+        state,
+        on_cancelled(state.user_state, subscription_end(reason)),
+      )
+    None ->
+      case outcome {
+        consumer_core.KeepRunning -> continue_with(state)
+        consumer_core.StopNormal -> actor.stop()
+        consumer_core.StopAbnormal(reason) -> actor.stop_abnormal(reason)
+      }
+  }
+}
+
+fn subscription_end(reason: protocol.CancelReason) -> sluice.SubscriptionEnd {
+  case reason {
+    protocol.Normal -> sluice.ProducerStopped
+    protocol.Shutdown -> sluice.ProducerStopped
+    protocol.Abnormal(reason) -> sluice.ProducerFailed(reason)
   }
 }
 

@@ -131,6 +131,49 @@ pub fn selector_does_not_stall_automatic_demand_test() {
   shutdown(counter)
 }
 
+// Replacement demand must return through the source mailbox. If it is
+// produced recursively, a selector that rejects every event keeps the source
+// inside one actor turn forever, so it cannot process a stop message.
+pub fn rejecting_selector_does_not_monopolise_source_test() {
+  let emitter_probe = process.new_subject()
+  let demand_probe = process.new_subject()
+  let assert Ok(counter) =
+    source.new_with_emitter(init: fn(emitter) {
+      process.send(emitter_probe, emitter)
+      Ok(0)
+    })
+    |> source.on_demand(fn(counter, demand) {
+      process.send(demand_probe, demand)
+      source.emit(count_up(counter, demand), counter + demand)
+    })
+    |> source.dispatcher(dispatcher.broadcast())
+    |> source.start()
+  let assert Ok(emitter) = process.receive(emitter_probe, 1000)
+  let assert Ok(rejector) = collector(process.new_subject()) |> sink.start()
+  process.unlink(counter.pid)
+  let monitor = process.monitor(counter.pid)
+
+  let assert Ok(_) =
+    sluice.subscription(to: counter.data)
+    |> sluice.min_demand(2)
+    |> sluice.max_demand(6)
+    |> sluice.cancel_mode(sluice.Temporary)
+    |> sluice.selector(keep: fn(_event) { False })
+    |> sluice.subscribe(consumer: rejector.data)
+
+  // The source enters replacement production. It must still return to its
+  // mailbox and process this external stop.
+  let assert Ok(_) = process.receive(demand_probe, 1000)
+  source.finish(emitter)
+  let down_selector =
+    process.new_selector()
+    |> process.select_specific_monitor(monitor, fn(down) { down })
+  let assert Ok(process.ProcessDown(_, _, process.Normal)) =
+    process.selector_receive(down_selector, 1000)
+
+  shutdown(rejector)
+}
+
 fn consecutive_evens(events: List(Int)) -> Bool {
   case events {
     [] -> True

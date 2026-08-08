@@ -6,8 +6,11 @@ import gleam/erlang/atom
 import gleam/erlang/process.{type ExitReason, type Monitor, type Subject}
 import gleam/int
 import gleam/list
+import gleam/option
 import gleam/otp/actor.{type Started}
 import sluice
+import sluice/internal/consumer_core
+import sluice/internal/protocol
 import sluice/sink
 import sluice/source
 
@@ -333,23 +336,54 @@ pub fn sibling_survives_other_consumers_death_test() {
 
 pub fn subscribe_timeout_is_configurable_test() {
   let batch_probe = process.new_subject()
+  let subscribed_probe = process.new_subject()
+  let cancelled_probe = process.new_subject()
   let assert Ok(counter) =
     counter_source(process.new_subject()) |> source.start()
   let assert Ok(other) = counter_source(process.new_subject()) |> source.start()
-  let assert Ok(collector) = lockstep_sink(batch_probe) |> sink.start()
+  let assert Ok(collector) =
+    lockstep_sink(batch_probe)
+    |> sink.on_subscribed(fn(state, _subscription) {
+      process.send(subscribed_probe, Nil)
+      sink.continue(state)
+    })
+    |> sink.on_cancelled(fn(state, _end) {
+      process.send(cancelled_probe, Nil)
+      sink.continue(state)
+    })
+    |> sink.start()
 
-  let assert Ok(_) =
+  // The first subscription is manual with one small ask. Thus the flow
+  // is finite and the sink becomes silent after the drain.
+  let assert Ok(first_subscription) =
     sluice.subscription(to: counter.data)
-    |> small_demand
+    |> sluice.demand_mode(sluice.Manual)
     |> sluice.subscribe(consumer: collector.data)
+  let assert Ok(Nil) = process.receive(subscribed_probe, 1000)
+  sluice.ask(subscription: first_subscription, count: 2)
 
   // The sink stays in its first batch. It can not answer a second
   // subscribe request, and the short timeout ends the wait.
-  let assert Ok(#(_events, _step)) = process.receive(batch_probe, 1000)
+  let assert Ok(#(_events, step)) = process.receive(batch_probe, 1000)
   assert sluice.subscription(to: other.data)
+    |> small_demand
     |> sluice.subscribe_timeout(milliseconds: 50)
     |> sluice.subscribe(consumer: collector.data)
     == Error(sluice.SubscribeTimeout)
+
+  // The request is withdrawn: when the sink continues, the provisional
+  // subscription is removed without becoming visible to the event handler
+  // or either lifecycle hook. The producer becomes free for a new
+  // subscription.
+  process.send(step, Nil)
+  drain_in_flight(batch_probe)
+  assert process.receive(subscribed_probe, 100) == Error(Nil)
+  assert process.receive(cancelled_probe, 100) == Error(Nil)
+  assert process.is_alive(collector.pid)
+  let assert Ok(_) =
+    sluice.subscription(to: other.data)
+    |> sluice.demand_mode(sluice.Manual)
+    |> sluice.subscribe(consumer: collector.data)
 
   shutdown(collector)
   shutdown(other)
@@ -364,4 +398,70 @@ pub fn start_timeout_is_configurable_test() {
     })
     |> source.start_timeout(milliseconds: 50)
     |> source.start()
+}
+
+// A delivery that arrives between a local cancellation and the
+// acknowledgement of the producer carries events from before the
+// cancellation. The consumer must process them, and it must not ask for
+// more.
+pub fn cancellation_does_not_discard_deliveries_test() {
+  let producer_probe = process.new_subject()
+  let batch_probe = process.new_subject()
+  let selector = process.new_selector()
+  let core = consumer_core.new()
+
+  // The test process is its own consumer stage here: it owns the
+  // subjects and drives the core directly, so each step is
+  // deterministic. The producer owner check needs a different live pid,
+  // so the fake producer points to a helper process.
+  let helper = process.spawn(fn() { process.sleep(5000) })
+  let fake_producer =
+    protocol.ProducerHandle(
+      send: fn(message) { process.send(producer_probe, message) },
+      owner: fn() { Ok(helper) },
+    )
+  let assert Ok(#(core, _selector, _handle)) =
+    consumer_core.add_subscription(
+      core,
+      selector,
+      fake_producer,
+      min_demand: 2,
+      max_demand: 6,
+      cancel: sluice.Permanent,
+      mode: sluice.Automatic,
+      metadata: protocol.default_metadata(),
+      reply: option.None,
+      tag_message: fn(_subject, _message) { Nil },
+      tag_down: fn(_subject, _down) { Nil },
+      make_cancel: fn(_subject) { fn() { Nil } },
+      make_ask: fn(_subject) { fn(_demand) { Nil } },
+    )
+  let assert Ok(protocol.Subscribe(subject, _metadata)) =
+    process.receive(producer_probe, 1000)
+  let assert Ok(protocol.Ask(_, 6)) = process.receive(producer_probe, 1000)
+
+  // The cancellation starts: the producer receives the cancel message.
+  let core = consumer_core.request_cancel(core:, subject:)
+  let assert Ok(protocol.Cancel(_)) = process.receive(producer_probe, 1000)
+
+  // A delivery from before the cancellation still reaches the handler,
+  // and the consumer asks for nothing more.
+  let #(_core, _state, _outcome) =
+    consumer_core.deliver(
+      core,
+      subject,
+      [1, 2, 3, 4, 5],
+      Nil,
+      fn(state, batch, _subscription) {
+        process.send(batch_probe, batch)
+        consumer_core.BatchContinue(state)
+      },
+      fn(_state) { True },
+    )
+  let assert Ok([1, 2, 3, 4]) = process.receive(batch_probe, 1000)
+  let assert Ok([5]) = process.receive(batch_probe, 1000)
+  assert process.receive(producer_probe, 100) == Error(Nil)
+
+  process.unlink(helper)
+  process.kill(helper)
 }

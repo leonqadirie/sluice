@@ -23,7 +23,15 @@ pub type Core(event) {
     dispatcher: Dispatcher(event),
     buffer: Buffer(event),
     subscribers: Dict(Subject(ConsumerMessage(event)), Monitor),
+    mode: AskMode(event),
   )
+}
+
+/// A source can accumulate the incoming asks, for example until the full
+/// pipeline stands. The `forward` function replays them.
+pub type AskMode(event) {
+  Forwarding
+  Accumulating(held: List(#(Subject(ConsumerMessage(event)), Int)))
 }
 
 /// A message that the stage must send to a subscriber.
@@ -39,9 +47,15 @@ type Chunks(event) =
   List(List(Outbound(event)))
 
 /// The result of `emit`: the next core, the messages for the subscribers,
-/// and the quantity of events that the overflow policy discarded.
+/// the quantity of events that the overflow policy discarded, and the
+/// demand that stays unfilled.
 pub type EmitResult(event) {
-  EmitResult(core: Core(event), outbound: List(Outbound(event)), discarded: Int)
+  EmitResult(
+    core: Core(event),
+    outbound: List(Outbound(event)),
+    discarded: Int,
+    unfilled: Int,
+  )
 }
 
 /// The result of `on_cancel`: the next core, the selector without the
@@ -60,7 +74,12 @@ pub fn new(
   dispatcher dispatcher: Dispatcher(event),
   buffer buffer: Buffer(event),
 ) -> Core(event) {
-  Core(dispatcher:, buffer:, subscribers: dict.new())
+  Core(dispatcher:, buffer:, subscribers: dict.new(), mode: Forwarding)
+}
+
+/// Start in the accumulation mode: the asks wait until `forward` runs.
+pub fn accumulate(core: Core(event)) -> Core(event) {
+  Core(..core, mode: Accumulating(held: []))
 }
 
 pub fn has_demand(core: Core(event)) -> Bool {
@@ -69,6 +88,10 @@ pub fn has_demand(core: Core(event)) -> Bool {
 
 pub fn buffer_is_empty(core: Core(event)) -> Bool {
   buffer.is_empty(core.buffer)
+}
+
+pub fn subscriber_count(core: Core(event)) -> Int {
+  dict.size(core.subscribers)
 }
 
 /// Send the outbound messages of a core operation to their subscribers,
@@ -136,37 +159,79 @@ pub fn on_ask(
   from from: Subject(ConsumerMessage(event)),
   demand demand: Int,
 ) -> #(Core(event), List(Outbound(event)), Int) {
+  case core.mode {
+    Accumulating(held) -> {
+      let mode = Accumulating(held: [#(from, demand), ..held])
+      #(Core(..core, mode:), [], 0)
+    }
+    Forwarding -> {
+      let #(core, chunks, unfilled) = forward_ask(core:, from:, demand:)
+      #(core, assemble(chunks), unfilled)
+    }
+  }
+}
+
+/// End the accumulation: replay the held asks in their sequence. Return
+/// the demand that the stage can make new events for.
+pub fn forward(
+  core: Core(event),
+) -> #(Core(event), List(Outbound(event)), Int) {
+  case core.mode {
+    Forwarding -> #(core, [], 0)
+    Accumulating(held) -> {
+      let core = Core(..core, mode: Forwarding)
+      let #(core, chunks, unfilled) =
+        list.fold(list.reverse(held), #(core, [], 0), fn(accumulated, ask) {
+          let #(core, chunks, unfilled) = accumulated
+          let #(from, demand) = ask
+          let #(core, replayed, added) = forward_ask(core:, from:, demand:)
+          #(core, list.append(replayed, chunks), unfilled + added)
+        })
+      #(core, assemble(chunks), unfilled)
+    }
+  }
+}
+
+fn forward_ask(
+  core core: Core(event),
+  from from: Subject(ConsumerMessage(event)),
+  demand demand: Int,
+) -> #(Core(event), Chunks(event), Int) {
   let #(new_demand, deliveries, next_dispatcher) =
     core.dispatcher.ask(demand, from)
   let core = Core(..core, dispatcher: next_dispatcher)
-  let buffered_before = buffer.size(core.buffer)
-  let #(core, chunks) = drain(core, [from_deliveries(deliveries)])
-  let taken = buffered_before - buffer.size(core.buffer)
-  #(core, assemble(chunks), int.max(new_demand - taken, 0))
+  let #(core, chunks, debt) =
+    drain(core:, chunks: [from_deliveries(deliveries)], debt: new_demand)
+  #(core, chunks, int.max(debt, 0))
 }
 
 /// Dispatch new events to the subscribers. Keep the events that are more
 /// than the recorded demand in the buffer. The result carries the
-/// outbound messages and the quantity of events that the overflow policy
-/// discarded.
+/// outbound messages, the quantity of events that the overflow policy
+/// discarded, and the replacement demand that filters released and that
+/// the buffer could not supply. The stage can make new events for the
+/// replacement demand.
 pub fn emit(
   core core: Core(event),
   events events: List(event),
 ) -> EmitResult(event) {
   case events {
-    [] -> EmitResult(core:, outbound: [], discarded: 0)
+    [] -> EmitResult(core:, outbound: [], discarded: 0, unfilled: 0)
     _ -> {
-      let #(core, chunks) = drain(core, [])
+      let #(core, chunks, debt) = drain(core:, chunks: [], debt: 0)
       case buffer.is_empty(core.buffer) {
         True -> {
           let result = core.dispatcher.dispatch(events, list.length(events))
-          let chunks = [from_deliveries(result.deliveries), ..chunks]
+          let #(core, chunks, extra) = settle(core:, result:, chunks:)
           let #(new_buffer, discarded) =
             buffer.store(core.buffer, result.leftover)
+          let core = Core(..core, buffer: new_buffer)
+          let #(core, chunks, debt) = drain(core:, chunks:, debt: debt + extra)
           EmitResult(
-            core: Core(..core, dispatcher: result.next, buffer: new_buffer),
+            core:,
             outbound: assemble(chunks),
             discarded:,
+            unfilled: int.max(debt, 0),
           )
         }
         // The buffer contains older events that no demand supplied. The
@@ -174,10 +239,13 @@ pub fn emit(
         // not change.
         False -> {
           let #(new_buffer, discarded) = buffer.store(core.buffer, events)
+          let #(core, chunks, debt) =
+            drain(core: Core(..core, buffer: new_buffer), chunks:, debt:)
           EmitResult(
-            core: Core(..core, buffer: new_buffer),
+            core:,
             outbound: assemble(chunks),
             discarded:,
+            unfilled: int.max(debt, 0),
           )
         }
       }
@@ -185,26 +253,51 @@ pub fn emit(
   }
 }
 
-// Supply the recorded demand from the buffer. Events that the dispatcher
-// does not deliver go to the front again. Thus the sequence stays.
+// Apply a dispatch result: collect the deliveries, and replay the
+// replacement asks through the normal ask path. Return the new demand
+// that the replacement asks release.
+fn settle(
+  core core: Core(event),
+  result result: dispatcher.DispatchResult(event),
+  chunks chunks: Chunks(event),
+) -> #(Core(event), Chunks(event), Int) {
+  let chunks = [from_deliveries(result.deliveries), ..chunks]
+  let core = Core(..core, dispatcher: result.next)
+  list.fold(result.reask, #(core, chunks, 0), fn(accumulated, replacement) {
+    let #(core, chunks, released) = accumulated
+    let #(from, demand) = replacement
+    let #(delta, deliveries, next_dispatcher) =
+      core.dispatcher.ask(demand, from)
+    #(
+      Core(..core, dispatcher: next_dispatcher),
+      [from_deliveries(deliveries), ..chunks],
+      released + delta,
+    )
+  })
+}
+
+// Supply the recorded demand from the buffer, until the demand or the
+// buffer is empty. The `debt` counts demand that entered through asks and
+// was not supplied: each event from the buffer decreases it, and each
+// replacement ask increases it. Events that the dispatcher does not
+// deliver go to the front again. Thus the sequence stays.
 fn drain(
-  core: Core(event),
-  chunks: Chunks(event),
-) -> #(Core(event), Chunks(event)) {
+  core core: Core(event),
+  chunks chunks: Chunks(event),
+  debt debt: Int,
+) -> #(Core(event), Chunks(event), Int) {
   let want = int.min(core.dispatcher.total_demand(), buffer.size(core.buffer))
   case want > 0 {
-    False -> #(core, chunks)
+    False -> #(core, chunks, debt)
     True -> {
       let #(buffered, remaining_buffer) = buffer.take(core.buffer, want)
       let result = core.dispatcher.dispatch(buffered, list.length(buffered))
-      #(
-        Core(
-          ..core,
-          dispatcher: result.next,
-          buffer: buffer.store_front(remaining_buffer, result.leftover),
-        ),
-        [from_deliveries(result.deliveries), ..chunks],
-      )
+      let #(core, chunks, extra) =
+        settle(core: Core(..core, buffer: remaining_buffer), result:, chunks:)
+      let core =
+        Core(..core, buffer: buffer.store_front(core.buffer, result.leftover))
+      let supplied = list.length(buffered) - list.length(result.leftover)
+      drain(core:, chunks:, debt: debt + extra - supplied)
     }
   }
 }
@@ -235,21 +328,34 @@ pub fn on_cancel(
     Ok(monitor) -> {
       process.demonitor_process(monitor)
       let selector = process.deselect_specific_monitor(selector, monitor)
-      let #(freed, next_dispatcher) = core.dispatcher.cancel(from)
+      let #(released, next_dispatcher) = core.dispatcher.cancel(from)
       let core =
         Core(
           ..core,
           dispatcher: next_dispatcher,
           subscribers: dict.delete(core.subscribers, from),
         )
-      let buffered_before = buffer.size(core.buffer)
-      let #(core, chunks) = drain(core, [acknowledgement(from, acknowledge)])
-      let taken = buffered_before - buffer.size(core.buffer)
+      let core = case core.mode {
+        Forwarding -> core
+        Accumulating(held) ->
+          Core(
+            ..core,
+            mode: Accumulating(
+              held: list.filter(held, fn(ask) { ask.0 != from }),
+            ),
+          )
+      }
+      let #(core, chunks, debt) =
+        drain(
+          core:,
+          chunks: [acknowledgement(from, acknowledge)],
+          debt: released,
+        )
       CancelResult(
         core:,
         selector:,
         outbound: assemble(chunks),
-        freed: int.max(freed - taken, 0),
+        freed: int.max(debt, 0),
       )
     }
   }

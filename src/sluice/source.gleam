@@ -5,8 +5,11 @@
 import gleam/bool
 import gleam/erlang/process.{type Down, type Selector, type Subject}
 import gleam/int
+import gleam/list
 import gleam/option.{type Option, None, Some}
 import gleam/otp/actor
+import gleam/result
+import gleam/yielder.{type Yielder}
 import sluice.{type Keep, type Outlet}
 import sluice/dispatcher.{type Dispatcher}
 import sluice/internal/buffer
@@ -18,6 +21,7 @@ import sluice/internal/protocol.{type ConsumerMessage, type ProducerMessage}
 /// `stop_abnormal`.
 pub opaque type Produce(state, event) {
   Emit(events: List(event), state: state)
+  EmitFinal(events: List(event))
   Stop
   StopAbnormal(reason: String)
 }
@@ -31,6 +35,14 @@ pub fn emit(
   state state: state,
 ) -> Produce(state, event) {
   Emit(events, state)
+}
+
+/// Emit the last events, and then stop the source with the normal
+/// reason. Use this when the source ends in the middle of a demand: the
+/// events go out first, and then the subscribers apply their cancel
+/// modes.
+pub fn emit_final(events: List(event)) -> Produce(state, event) {
+  EmitFinal(events)
 }
 
 /// Stop the source with the normal reason. The subscribers apply their
@@ -112,6 +124,8 @@ pub opaque type Builder(state, event) {
     on_discard: fn(state, Int) -> state,
     messages: Option(fn() -> Selector(Message(state, event))),
     dispatcher: Dispatcher(event),
+    on_subscribers: fn(state, sluice.SubscriberChange) -> state,
+    accumulate: Bool,
   )
 }
 
@@ -125,13 +139,12 @@ fn default_on_discard(state: state, count: Int) -> state {
   state
 }
 
-/// Define a source that makes events on demand.
-pub fn new(
-  init state: state,
+fn default_builder(
+  initialise initialise: fn(Emitter(event)) -> Result(state, String),
   on_demand on_demand: fn(state, Int) -> Produce(state, event),
 ) -> Builder(state, event) {
   Builder(
-    initialise: fn(_emitter) { Ok(state) },
+    initialise:,
     on_demand:,
     capacity: buffer.Bounded(10_000),
     keep: sluice.KeepLast,
@@ -140,7 +153,17 @@ pub fn new(
     on_discard: default_on_discard,
     messages: None,
     dispatcher: dispatcher.demand(),
+    on_subscribers: fn(state, _change) { state },
+    accumulate: False,
   )
+}
+
+/// Define a source that makes events on demand.
+pub fn new(
+  init state: state,
+  on_demand on_demand: fn(state, Int) -> Produce(state, event),
+) -> Builder(state, event) {
+  default_builder(initialise: fn(_emitter) { Ok(state) }, on_demand:)
 }
 
 /// Define a source that receives its events from an external location. The
@@ -151,17 +174,38 @@ pub fn new(
 pub fn new_with_emitter(
   init initialise: fn(Emitter(event)) -> Result(state, String),
 ) -> Builder(state, event) {
-  Builder(
-    initialise:,
-    on_demand: fn(state, _demand) { Emit([], state) },
-    capacity: buffer.Bounded(10_000),
-    keep: sluice.KeepLast,
-    name: None,
-    start_timeout: 5000,
-    on_discard: default_on_discard,
-    messages: None,
-    dispatcher: dispatcher.demand(),
+  default_builder(initialise:, on_demand: fn(state, _demand) { Emit([], state) })
+}
+
+/// Define a source that takes its events from a yielder. The source
+/// steps the yielder as far as the demand asks. It stops with the normal
+/// reason at the end of the yielder.
+pub fn from_yielder(
+  yielder yielder: Yielder(event),
+) -> Builder(Yielder(event), event) {
+  new(init: yielder, on_demand: fn(remaining, demand) {
+    step_yielder(remaining:, count: demand, taken: [])
+  })
+}
+
+fn step_yielder(
+  remaining remaining: Yielder(event),
+  count count: Int,
+  taken taken: List(event),
+) -> Produce(Yielder(event), event) {
+  use <- bool.guard(
+    when: count <= 0,
+    return: Emit(list.reverse(taken), remaining),
   )
+  case yielder.step(remaining) {
+    yielder.Done ->
+      case taken {
+        [] -> Stop
+        _ -> EmitFinal(list.reverse(taken))
+      }
+    yielder.Next(event, remaining) ->
+      step_yielder(remaining:, count: count - 1, taken: [event, ..taken])
+  }
 }
 
 /// Set the demand handler of a source that `new_with_emitter` made.
@@ -195,6 +239,26 @@ pub fn buffer_keep(
   keep keep: Keep,
 ) -> Builder(state, event) {
   Builder(..builder, keep:)
+}
+
+/// Start the source in the accumulation mode: incoming asks wait, and
+/// the source makes no events. A call of `sluice.forward_demand` on the
+/// outlet releases the held asks. Use this to connect a full pipeline
+/// before the events start to move.
+pub fn accumulate_demand(
+  builder: Builder(state, event),
+) -> Builder(state, event) {
+  Builder(..builder, accumulate: True)
+}
+
+/// Set a hook that runs when a subscriber arrives or leaves. Use it, for
+/// example, to start work at the first subscriber and to stop work at the
+/// last one.
+pub fn on_subscribers(
+  builder: Builder(state, event),
+  on_subscribers: fn(state, sluice.SubscriberChange) -> state,
+) -> Builder(state, event) {
+  Builder(..builder, on_subscribers:)
 }
 
 /// Set the dispatcher of the source. The default is the demand
@@ -262,6 +326,7 @@ type Message(state, event) {
   SubscriberDown(from: Subject(ConsumerMessage(event)), down: Down)
   FromEmitter(message: EmitterMessage(event))
   FromUser(apply: fn(state) -> Produce(state, event))
+  DeferredDemand(demand: Int)
 }
 
 type State(state, event) {
@@ -269,8 +334,10 @@ type State(state, event) {
     user_state: state,
     core: producer_core.Core(event),
     selector: Selector(Message(state, event)),
+    deferred_demand: Subject(Int),
     on_demand: fn(state, Int) -> Produce(state, event),
     on_discard: fn(state, Int) -> state,
+    on_subscribers: fn(state, sluice.SubscriberChange) -> state,
   )
 }
 
@@ -294,10 +361,37 @@ fn initialise(
   String,
 ) {
   let emitter_subject = process.new_subject()
+  let deferred_demand = process.new_subject()
   let base_selector =
     process.new_selector()
     |> process.select_map(emitter_subject, FromEmitter)
-  let faces = case builder.name {
+    |> process.select_map(deferred_demand, DeferredDemand)
+  use #(outlet, selector) <- result.try(select_faces(builder, base_selector))
+  let selector = merge_user_messages(selector, builder.messages)
+  use user_state <- result.try(builder.initialise(Emitter(emitter_subject)))
+  let core = build_core(builder)
+  actor.initialised(State(
+    user_state:,
+    core:,
+    selector:,
+    deferred_demand:,
+    on_demand: builder.on_demand,
+    on_discard: builder.on_discard,
+    on_subscribers: builder.on_subscribers,
+  ))
+  |> actor.selecting(selector)
+  |> actor.returning(outlet)
+  |> Ok
+}
+
+// The producer face of the source: a plain subject, or the registered
+// name.
+// nolint: stringly_typed_error -- feeds the actor initialiser, which requires String errors
+fn select_faces(
+  builder: Builder(state, event),
+  base_selector: Selector(Message(state, event)),
+) -> Result(#(Outlet(event), Selector(Message(state, event))), String) {
+  case builder.name {
     None -> {
       let subject = process.new_subject()
       let outlet =
@@ -321,31 +415,17 @@ fn initialise(
         }
       }
   }
-  case faces {
-    Error(reason) -> Error(reason)
-    Ok(#(outlet, selector)) -> {
-      let selector = merge_user_messages(selector, builder.messages)
-      case builder.initialise(Emitter(emitter_subject)) {
-        Error(reason) -> Error(reason)
-        Ok(user_state) -> {
-          let core =
-            producer_core.new(
-              dispatcher.build(builder.dispatcher),
-              buffer.new(builder.capacity, builder.keep),
-            )
-          actor.initialised(State(
-            user_state:,
-            core:,
-            selector:,
-            on_demand: builder.on_demand,
-            on_discard: builder.on_discard,
-          ))
-          |> actor.selecting(selector)
-          |> actor.returning(outlet)
-          |> Ok
-        }
-      }
-    }
+}
+
+fn build_core(builder: Builder(state, event)) -> producer_core.Core(event) {
+  let core =
+    producer_core.new(
+      dispatcher.build(builder.dispatcher),
+      buffer.new(builder.capacity, builder.keep),
+    )
+  case builder.accumulate {
+    True -> producer_core.accumulate(core)
+    False -> core
   }
 }
 
@@ -365,6 +445,7 @@ fn handle_message(
 ) -> actor.Next(State(state, event), Message(state, event)) {
   case message {
     FromDownstream(protocol.Subscribe(from, metadata)) -> {
+      let before = producer_core.subscriber_count(state.core)
       let #(core, selector, outbound) =
         producer_core.on_subscribe(
           state.core,
@@ -374,11 +455,29 @@ fn handle_message(
           SubscriberDown,
         )
       producer_core.send_all(outbound)
-      continue_with(State(..state, core:, selector:))
+      let count = producer_core.subscriber_count(core)
+      let user_state = case count > before {
+        True ->
+          state.on_subscribers(
+            state.user_state,
+            sluice.SubscriberArrived(count),
+          )
+        False -> state.user_state
+      }
+      continue_with(State(..state, core:, selector:, user_state:))
     }
     FromDownstream(protocol.Ask(from, demand)) -> {
       let #(core, outbound, unfilled) =
         producer_core.on_ask(state.core, from, demand)
+      producer_core.send_all(outbound)
+      let state = State(..state, core:)
+      case unfilled > 0 {
+        False -> actor.continue(state)
+        True -> produce(state, unfilled)
+      }
+    }
+    FromDownstream(protocol.ForwardDemand) -> {
+      let #(core, outbound, unfilled) = producer_core.forward(state.core)
       producer_core.send_all(outbound)
       let state = State(..state, core:)
       case unfilled > 0 {
@@ -391,15 +490,17 @@ fn handle_message(
     SubscriberDown(from, _down) ->
       subscriber_gone(state:, from:, acknowledge: False)
     FromEmitter(Pushed(events)) -> {
-      let producer_core.EmitResult(core:, outbound:, discarded:) =
+      let producer_core.EmitResult(core:, outbound:, discarded:, unfilled:) =
         producer_core.emit(state.core, events)
       producer_core.send_all(outbound)
       let user_state =
         report_discards(state:, user_state: state.user_state, discarded:)
-      actor.continue(State(..state, core:, user_state:))
+      let state = State(..state, core:, user_state:)
+      defer_demand(state, unfilled)
     }
     FromEmitter(Finished) -> actor.stop()
     FromUser(apply) -> apply_produce(state, apply(state.user_state))
+    DeferredDemand(demand) -> produce(state, demand)
   }
 }
 
@@ -416,14 +517,37 @@ fn apply_produce(
 ) -> actor.Next(State(state, event), Message(state, event)) {
   case produced {
     Emit(events, user_state) -> {
-      let producer_core.EmitResult(core:, outbound:, discarded:) =
+      let producer_core.EmitResult(core:, outbound:, discarded:, unfilled:) =
         producer_core.emit(state.core, events)
       producer_core.send_all(outbound)
       let user_state = report_discards(state:, user_state:, discarded:)
-      actor.continue(State(..state, core:, user_state:))
+      let state = State(..state, core:, user_state:)
+      // Filters on broadcast subscriptions can release replacement
+      // demand. Defer it through the actor mailbox so a selector that
+      // rejects every event cannot monopolise this process.
+      defer_demand(state, unfilled)
+    }
+    EmitFinal(events) -> {
+      let producer_core.EmitResult(outbound:, ..) =
+        producer_core.emit(state.core, events)
+      producer_core.send_all(outbound)
+      actor.stop()
     }
     Stop -> actor.stop()
     StopAbnormal(reason) -> actor.stop_abnormal(reason)
+  }
+}
+
+fn defer_demand(
+  state: State(state, event),
+  demand: Int,
+) -> actor.Next(State(state, event), Message(state, event)) {
+  case demand > 0 {
+    False -> actor.continue(state)
+    True -> {
+      process.send(state.deferred_demand, demand)
+      actor.continue(state)
+    }
   }
 }
 
@@ -434,10 +558,16 @@ fn subscriber_gone(
   from from: Subject(ConsumerMessage(event)),
   acknowledge acknowledge: Bool,
 ) -> actor.Next(State(state, event), Message(state, event)) {
+  let before = producer_core.subscriber_count(state.core)
   let producer_core.CancelResult(core:, selector:, outbound:, freed:) =
     producer_core.on_cancel(state.core, state.selector, from, acknowledge:)
   producer_core.send_all(outbound)
-  let state = State(..state, core:, selector:)
+  let count = producer_core.subscriber_count(core)
+  let user_state = case count < before {
+    True -> state.on_subscribers(state.user_state, sluice.SubscriberLeft(count))
+    False -> state.user_state
+  }
+  let state = State(..state, core:, selector:, user_state:)
   case freed > 0 {
     False -> continue_with(state)
     True -> produce(state, freed) |> actor.with_selector(selector)

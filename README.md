@@ -177,6 +177,23 @@ let assert Ok(measurements) =
   |> source.start()
 ```
 
+## Subscription hooks
+
+A producer stage can see its subscriber group: `on_subscribers` runs when
+a subscriber arrives or leaves, with the new quantity of subscribers. Use
+it to start work at the first subscriber and to stop work at the last
+one. A sink has two hooks: `on_subscribed` receives each new
+`Subscription`, and `on_cancelled` runs when a subscription ends. When
+`on_cancelled` is set, it decides what the sink does, and the cancel mode
+does not apply.
+
+## Accumulate demand at the start
+
+A source with `accumulate_demand` holds the incoming asks and makes no
+events. A call of `sluice.forward_demand(outlet:)` releases the held
+asks. Use this to connect a full pipeline before the events start to
+move.
+
 ## Manual demand
 
 Some consumers must control the flow themselves, for example because they
@@ -246,6 +263,24 @@ You can also cancel a subscription with `sluice.cancel`. Each `on_events`
 callback receives its `Subscription`. Thus a stage can disconnect itself
 while events move.
 
+## Yielders and folds
+
+`source.from_yielder` makes a source from a yielder; the source stops
+with the normal reason at the end of the yielder. A source callback can
+also end the flow itself with `source.emit_final(events)`: the last
+events go out, and then the source stops. In the other direction,
+`sink.fold` runs the full flow of an outlet through a fold and returns
+the final value:
+
+```gleam
+import gleam/yielder
+
+let assert Ok(numbers) =
+  source.from_yielder(yielder.range(1, 100)) |> source.start()
+let assert Ok(total) =
+  sink.fold(from: numbers.data, initial: 0, with: int.add, within: 5000)
+```
+
 ## Supervision
 
 Stages start as standard OTP actors. Thus a `static_supervisor` can hold
@@ -297,12 +332,6 @@ the correct sequence. Each stage connects again through the names.
 - One sink can use two sources that have different event types. To do
   this, make a sum type for the sink. Then put a small gate after each
   source. Each gate changes the source type to the sum type.
-
-## Roadmap
-
-- Pooled event processing, which sends batches to a group of workers.
-- Subscriber hooks on producer stages.
-- Sources from yielders, and pipelines as folds.
 
 ## Inspiration
 

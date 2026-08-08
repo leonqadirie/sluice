@@ -11,6 +11,7 @@
 import gleam/erlang/process.{type Pid, type Subject}
 import gleam/int
 import gleam/option.{Some}
+import sluice/internal/platform
 import sluice/internal/protocol.{
   type ConsumerMessage, type ProducerHandle, type SubscribeMetadata,
 }
@@ -25,6 +26,25 @@ pub type CancelMode {
   Transient
   /// The consumer continues and removes the subscription.
   Temporary
+}
+
+/// A change of the subscriber group of a producer stage. The producer
+/// hooks set with `on_subscribers` receive it.
+pub type SubscriberChange {
+  /// A subscriber arrived. `count` is the new quantity of subscribers.
+  SubscriberArrived(count: Int)
+  /// A subscriber left. `count` is the new quantity of subscribers.
+  SubscriberLeft(count: Int)
+}
+
+/// The cause of the end of a subscription, from the view of the consumer.
+/// The consumer hooks set with `on_cancelled` receive it.
+pub type SubscriptionEnd {
+  /// The producer stopped with the normal reason or with a shutdown, or
+  /// it acknowledged a cancellation.
+  ProducerStopped
+  /// The producer failed, or it refused the subscription.
+  ProducerFailed(reason: String)
 }
 
 /// How a subscription requests events.
@@ -94,6 +114,12 @@ pub type ConsumerControl(event) {
   )
   CancelSubscription(subject: Subject(ConsumerMessage(event)))
   RequestDemand(subject: Subject(ConsumerMessage(event)), demand: Int)
+  ConfirmSubscribe(
+    reply: Subject(Result(Subscription, SubscribeError)),
+    confirmed: Subject(Nil),
+    deadline: Int,
+  )
+  AbandonSubscribe(reply: Subject(Result(Subscription, SubscribeError)))
 }
 
 /// The options for a connection between an inlet and an outlet. Make the
@@ -237,6 +263,7 @@ pub fn subscribe(
         False -> Error(ConsumerNotAlive)
         True -> {
           let reply = process.new_subject()
+          let deadline = platform.monotonic_milliseconds() + options.timeout
           inlet.send(SubscribeTo(
             producer: options.producer,
             min_demand: options.min_demand,
@@ -246,13 +273,42 @@ pub fn subscribe(
             mode: options.mode,
             reply:,
           ))
-          case process.receive(reply, options.timeout) {
-            Ok(result) -> result
-            Error(Nil) -> Error(SubscribeTimeout)
-          }
+          await_subscribe_reply(inlet:, reply:, deadline:)
         }
       }
   }
+}
+
+fn await_subscribe_reply(
+  inlet inlet: Inlet(event),
+  reply reply: Subject(Result(Subscription, SubscribeError)),
+  deadline deadline: Int,
+) -> Result(Subscription, SubscribeError) {
+  case process.receive(reply, remaining_time(deadline)) {
+    Ok(Ok(subscription)) -> {
+      let confirmed = process.new_subject()
+      inlet.send(ConfirmSubscribe(reply, confirmed, deadline))
+      case process.receive(confirmed, remaining_time(deadline)) {
+        Ok(Nil) -> Ok(subscription)
+        Error(Nil) -> {
+          inlet.send(AbandonSubscribe(reply))
+          Error(SubscribeTimeout)
+        }
+      }
+    }
+    Ok(Error(error)) -> Error(error)
+    Error(Nil) -> {
+      // Withdraw the request. SubscribeTo and AbandonSubscribe come from
+      // this process, so the consumer sees them in sequence and removes
+      // the provisional state without activating the subscription.
+      inlet.send(AbandonSubscribe(reply))
+      Error(SubscribeTimeout)
+    }
+  }
+}
+
+fn remaining_time(deadline: Int) -> Int {
+  int.max(deadline - platform.monotonic_milliseconds(), 0)
 }
 
 fn inlet_alive(inlet: Inlet(event)) -> Bool {
@@ -260,6 +316,14 @@ fn inlet_alive(inlet: Inlet(event)) -> Bool {
     Error(Nil) -> False
     Ok(pid) -> process.is_alive(pid)
   }
+}
+
+/// End the accumulation of demand on a source that
+/// `source.accumulate_demand` configured. The source then replays the
+/// held asks and starts to make events. A source without accumulation
+/// ignores this call.
+pub fn forward_demand(outlet outlet: Outlet(event)) -> Nil {
+  outlet.producer.send(protocol.ForwardDemand)
 }
 
 /// Cancel a subscription. The consumer disconnects from the producer. Then
@@ -304,23 +368,30 @@ pub fn make_subscription(
   Subscription(cancel:, ask:)
 }
 
+/// The fields of `SubscriptionOptions`, with labels, for the internal
+/// consumers of the opaque type.
+@internal
+pub type OptionsFields(event) {
+  OptionsFields(
+    producer: ProducerHandle(event),
+    min_demand: Int,
+    max_demand: Int,
+    cancel: CancelMode,
+    metadata: SubscribeMetadata(event),
+    mode: DemandMode,
+  )
+}
+
 @internal
 pub fn options_fields(
   options: SubscriptionOptions(event),
-) -> #(
-  ProducerHandle(event),
-  Int,
-  Int,
-  CancelMode,
-  SubscribeMetadata(event),
-  DemandMode,
-) {
-  #(
-    options.producer,
-    options.min_demand,
-    options.max_demand,
-    options.cancel,
-    options.metadata,
-    options.mode,
+) -> OptionsFields(event) {
+  OptionsFields(
+    producer: options.producer,
+    min_demand: options.min_demand,
+    max_demand: options.max_demand,
+    cancel: options.cancel,
+    metadata: options.metadata,
+    mode: options.mode,
   )
 }

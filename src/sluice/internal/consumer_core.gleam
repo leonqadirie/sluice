@@ -9,7 +9,7 @@ import gleam/erlang/process.{
 }
 import gleam/int
 import gleam/list
-import gleam/option.{type Option, Some}
+import gleam/option.{type Option, None, Some}
 import gleam/result
 import sluice.{
   type CancelMode, type DemandMode, type SubscribeError, type Subscription,
@@ -28,6 +28,7 @@ pub type SubscriptionState(event) {
     /// duplicate check, so a subsequent partition dispatcher can accept
     /// one subscription for each partition to the same producer.
     partition: Option(Int),
+    metadata: SubscribeMetadata(event),
     monitor: Monitor,
     cancel: CancelMode,
     mode: DemandMode,
@@ -40,6 +41,10 @@ pub type SubscriptionState(event) {
     /// connect their two faces.
     held_ask: Int,
     handle: Subscription,
+    /// The reply subject of the subscribe request, for runtime
+    /// subscriptions. An abandonment after a timeout finds the
+    /// subscription through it.
+    reply: Option(Subject(Result(Subscription, SubscribeError))),
     cancelling: Bool,
   )
 }
@@ -57,9 +62,10 @@ pub fn new() -> Core(event) {
   Core(subscriptions: dict.new())
 }
 
-/// Make a new subscription: monitor the producer, make the subscription
-/// subject, select the subject and the monitor, and send `Subscribe` and
-/// the first `Ask`.
+/// Prepare a new subscription: monitor the producer, make the subscription
+/// subject, and select the subject and monitor. Declared subscriptions send
+/// `Subscribe` and the first `Ask` immediately. Runtime subscriptions wait
+/// for the caller's confirmation.
 pub fn add_subscription(
   core: Core(event),
   selector: Selector(message),
@@ -69,6 +75,7 @@ pub fn add_subscription(
   cancel cancel: CancelMode,
   mode mode: DemandMode,
   metadata metadata: SubscribeMetadata(event),
+  reply reply: Option(Subject(Result(Subscription, SubscribeError))),
   tag_message tag_message: fn(
     Subject(ConsumerMessage(event)),
     ConsumerMessage(event),
@@ -105,17 +112,10 @@ pub fn add_subscription(
       tag_down(subject, down)
     })
   let handle = sluice.make_subscription(make_cancel(subject), make_ask(subject))
-  producer.send(protocol.Subscribe(
-    from: subject,
-    metadata: SubscribeMetadata(..metadata, max_demand: Some(max_demand)),
-  ))
-  // In the manual mode the consumer asks nothing by itself: the first
-  // events come after a call of `ask`.
+  // Runtime subscriptions remain provisional until the caller confirms
+  // the successful reply. Declared subscriptions activate immediately.
   let outstanding = case mode {
-    sluice.Automatic -> {
-      producer.send(protocol.Ask(from: subject, demand: max_demand))
-      max_demand
-    }
+    sluice.Automatic -> max_demand
     sluice.Manual -> 0
   }
   let subscription =
@@ -124,6 +124,7 @@ pub fn add_subscription(
       producer:,
       producer_pid: pid,
       partition: metadata.partition,
+      metadata:,
       monitor:,
       cancel:,
       mode:,
@@ -132,11 +133,38 @@ pub fn add_subscription(
       outstanding:,
       held_ask: 0,
       handle:,
+      reply:,
       cancelling: False,
     )
+  let subscription = case reply {
+    None -> activate(subscription, metadata)
+    Some(_) -> subscription
+  }
   let core =
     Core(subscriptions: dict.insert(core.subscriptions, subject, subscription))
   Ok(#(core, selector, handle))
+}
+
+fn activate(
+  subscription: SubscriptionState(event),
+  metadata: SubscribeMetadata(event),
+) -> SubscriptionState(event) {
+  subscription.producer.send(protocol.Subscribe(
+    from: subscription.subject,
+    metadata: SubscribeMetadata(
+      ..metadata,
+      max_demand: Some(subscription.max_demand),
+    ),
+  ))
+  case subscription.mode {
+    sluice.Automatic ->
+      subscription.producer.send(protocol.Ask(
+        from: subscription.subject,
+        demand: subscription.max_demand,
+      ))
+    sluice.Manual -> Nil
+  }
+  subscription
 }
 
 // The `owner` function alone does not show that the process is alive.
@@ -360,6 +388,63 @@ pub fn request_demand(
       )
     }
   }
+}
+
+/// Confirm a runtime subscription after its caller receives the successful
+/// reply. Activation sends the protocol messages only now, so the
+/// `on_subscribed` hook and event flow cannot precede the caller's success.
+pub fn confirm(
+  core core: Core(event),
+  reply reply: Subject(Result(Subscription, SubscribeError)),
+) -> #(Core(event), Option(Subscription)) {
+  case find_by_reply(core, reply) {
+    Error(Nil) -> #(core, None)
+    Ok(subscription) -> {
+      let subscription =
+        activate(
+          SubscriptionState(..subscription, reply: None),
+          subscription.metadata,
+        )
+      #(store(core, subscription), Some(subscription.handle))
+    }
+  }
+}
+
+/// Remove a provisional subscription after its caller times out. No
+/// producer messages or application hooks have run for it.
+pub fn abandon(
+  core core: Core(event),
+  selector selector: Selector(message),
+  reply reply: Subject(Result(Subscription, SubscribeError)),
+) -> #(Core(event), Selector(message)) {
+  case find_by_reply(core, reply) {
+    Error(Nil) -> #(core, selector)
+    Ok(subscription) -> {
+      process.demonitor_process(subscription.monitor)
+      let selector =
+        selector
+        |> process.deselect(subscription.subject)
+        |> process.deselect_specific_monitor(subscription.monitor)
+      let core =
+        Core(subscriptions: dict.delete(
+          core.subscriptions,
+          subscription.subject,
+        ))
+      #(core, selector)
+    }
+  }
+}
+
+fn find_by_reply(
+  core: Core(event),
+  reply: Subject(Result(Subscription, SubscribeError)),
+) -> Result(SubscriptionState(event), Nil) {
+  dict.fold(core.subscriptions, Error(Nil), fn(found, _subject, subscription) {
+    case subscription.reply == Some(reply) {
+      True -> Ok(subscription)
+      False -> found
+    }
+  })
 }
 
 /// A local cancellation: tell the producer. Then wait for its
