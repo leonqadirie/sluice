@@ -5,8 +5,8 @@
 
 Stage pipelines for Gleam, with demand control and backpressure.
 
-A pipeline is a chain of stages that events flow through. There are three
-kinds of stages:
+A pipeline is a chain of stages that events flow through; stages can also
+branch and merge into a graph. There are three kinds of stages:
 
 - A **Source** produces events.
 - A **Gate** receives events, transforms them, and passes them on. A gate
@@ -21,10 +21,10 @@ events:   Source ──▶ Gate ──▶ Sink
 demand:   Source ◀── Gate ◀── Sink
 ```
 
-Nothing moves until the consuming side asks for events. Because of this, a
-slow sink slows down every stage before it, mailboxes stay bounded, and
-you never need to poll. No event is dropped silently: a stage that must
-drop events logs a warning first.
+Nothing moves until the consuming side asks for events. Because of this,
+a slow sink is never overwhelmed: backpressure spreads to the stages
+before it, mailboxes stay bounded, and you never need to poll. No event
+is dropped silently: a stage that must drop events logs a warning first.
 
 ## When to use sluice
 
@@ -214,7 +214,28 @@ let assert Ok(measurements) =
 ```
 
 The source sends pushed events to its consumers right away, up to the
-open demand. The buffer holds the rest.
+open demand. The buffer holds the rest. Backpressure can't slow the
+outside world down: if pushes keep outrunning demand, the buffer fills
+and the overflow policy decides what to drop.
+
+## Fan out and fan in
+
+A pipeline doesn't have to be a straight line. A producer can have many
+subscribers, and its dispatcher decides which events go where: split the
+work across subscribers, copy every event to all of them, or partition
+by key (see [Dispatchers](#dispatchers) below). With the default demand
+dispatcher, a slow subscriber doesn't hold the others back — events flow
+to whoever has open demand.
+
+A consumer can also subscribe to many producers. Each subscription
+tracks its own demand, and the `on_events` callback receives the
+subscription a batch came from, so a sink can tell its producers apart.
+The producers must share one event type; to merge sources with different
+types, see [Design notes](#design-notes).
+
+Combine both and a pipeline becomes a graph: one source feeding several
+gates, or several gates feeding one sink, with demand accounted for on
+every connection.
 
 ## Dispatchers
 
