@@ -26,10 +26,15 @@ pub opaque type Produce(state, event) {
   StopAbnormal(reason: String)
 }
 
-/// Emit events for the demand. The quantity of events can be less than the
-/// demand, or zero. The demand that stays open is then supplied by
-/// subsequent pushes through an `Emitter`. The quantity can also be more
-/// than the demand. The buffer keeps the extra events.
+/// Emit events for the demand. The quantity of events can be more than
+/// the demand: the buffer keeps the extra events. The quantity can also
+/// be less than the demand, or zero. The demand that stays open is then
+/// supplied by later events, from a push through an `Emitter` or from a
+/// message handler that emits.
+///
+/// Emit less than the demand only when such later events can come:
+/// without them, the consumers wait for the open demand and do not ask
+/// again. A source that ends must end with `emit_final`.
 pub fn emit(
   events events: List(event),
   state state: state,
@@ -46,7 +51,13 @@ pub fn emit_final(events: List(event)) -> Produce(state, event) {
 }
 
 /// Stop the source with the normal reason. The subscribers apply their
-/// cancel modes. Use this to stop a pipeline that has an end.
+/// cancel modes.
+///
+/// The demand handler runs again only when a consumer asks again, and a
+/// consumer asks again only after it received its full demand. Thus
+/// `stop` can end the source only after emits that filled the demand
+/// completely. When the events end in the middle of a demand, use
+/// `emit_final` in that same call.
 pub fn stop() -> Produce(state, event) {
   Stop
 }
