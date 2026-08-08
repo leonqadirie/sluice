@@ -10,8 +10,7 @@ branch and merge into a graph. There are three kinds of stages:
 
 - A **Source** produces events.
 - A **Gate** receives events, transforms them, and passes them on. A gate
-  can emit zero, one, or many events for each event it receives, so gates
-  can also filter, expand, and aggregate.
+  can emit 0-n events for each event it receives.
 - A **Sink** consumes events.
 
 Events flow forward through the pipeline. Demand flows backward:
@@ -39,7 +38,19 @@ You don't need sluice for a one-off parallel computation over data you
 already have in memory; spawning ordinary processes is simpler. Reach for
 sluice when the stages are long-lived processes and the data never stops.
 
-## Outlets and inlets
+## What sluice does not do
+
+- Sluice does not store events. Events live in mailboxes and buffers,
+  and they are lost when a stage stops or a full buffer drops them. Keep
+  a durable copy outside the pipeline if you need one.
+- Sluice does not deliver events a second time. When a consumer crashes,
+  the events on their way to it are lost. If every event must be
+  handled, feed the pipeline from a source that can replay, such as a
+  job queue or an event store.
+- Sluice does not spread work across machines. A pipeline runs on one
+  BEAM node, using as many processes on that node as you give it.
+
+## How do stages connect?
 
 Every connection runs from an **outlet** to an **inlet**. An outlet is
 the face of a stage that provides events. An inlet is the face that
@@ -125,7 +136,7 @@ cd example
 gleam run --module counter_pipeline
 ```
 
-## Demand
+## Who sets the pace?
 
 When an inlet subscribes to an outlet, the consumer immediately asks for
 `max_demand` events. Delivered events reach the `on_events` callback in
@@ -331,7 +342,7 @@ let assert Ok(prices) =
   |> source.start()
 ```
 
-## When stages stop
+## What happens when a stage stops?
 
 Every subscription has a cancel mode, which tells the consumer stage what
 to do when the subscription ends. A subscription ends when the producer
