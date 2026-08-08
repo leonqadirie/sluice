@@ -245,8 +245,8 @@ pub fn start(
   |> actor.start()
 }
 
-/// Ask a child to stop. Successfully terminated event children return one
-/// demand credit to their producer.
+/// Ask a child to stop. A successfully terminated event child frees its
+/// slot, and the demand returns to its producer.
 ///
 /// * `supervisor`: The supervisor that owns the child.
 /// * `pid`: The pid of the child.

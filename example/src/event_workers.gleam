@@ -2,9 +2,9 @@
 ////
 //// `consumer_supervisor` starts one linked OTP child for each event,
 //// like a supervisor with one child specification. `max_demand` limits
-//// the quantity of children that run at the same time. A credit
-//// returns only when its child terminates, so the demand follows the
-//// true work speed. `pool.sink` is similar but lighter: it gives no
+//// the quantity of children that run at the same time. A slot
+//// becomes free only when its child terminates, so the demand follows
+//// the true work speed. `pool.sink` is similar but lighter: it gives no
 //// restart policy and no child inspection.
 ////
 //// Run this example from the `example` directory:

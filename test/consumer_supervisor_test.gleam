@@ -70,7 +70,8 @@ pub fn demand_follows_final_child_termination_test() {
   process.send(first_action, Complete)
   assert process.receive(probe, 100) == Error(Nil)
 
-  // The second completion restores the two freed credits together.
+  // The second completion frees the second slot. One ask then refills
+  // the two slots together.
   process.send(second_action, Complete)
   let assert Ok(WorkerOffer(third, _, _)) = process.receive(probe, 1000)
   let assert Ok(WorkerOffer(fourth, _, _)) = process.receive(probe, 1000)
@@ -105,7 +106,7 @@ pub fn transient_child_restarts_same_event_without_releasing_demand_test() {
   support.shutdown(counter)
 }
 
-pub fn temporary_child_failure_releases_its_credit_test() {
+pub fn temporary_child_failure_frees_its_slot_test() {
   let probe = process.new_subject()
   let assert Ok(counter) = support.counter_source() |> source.start()
   let assert Ok(supervisor) =
@@ -196,8 +197,8 @@ pub fn immediate_completion_has_no_monitoring_gap_test() {
   subscribe(counter, supervisor.data, min: 0, max: 1)
 
   // The child can finish before its start function returns. Because the
-  // supervisor owns the link before it handles the exit, the credit is still
-  // returned and the next ask arrives.
+  // supervisor owns the link before it handles the exit, the slot is still
+  // freed and the next ask arrives.
   let assert Ok(1) = process.receive(demand_probe, 1000)
   let assert Ok(1) = process.receive(demand_probe, 1000)
 
@@ -263,8 +264,8 @@ pub fn child_start_panic_is_a_failed_event_not_a_supervisor_crash_test() {
     |> consumer_supervisor.start()
   subscribe(counter, supervisor.data, min: 0, max: 1)
 
-  // Event zero is discarded after its start callback panics. Its credit is
-  // returned and the still-live supervisor starts event one.
+  // Event zero is discarded after its start callback panics. Its slot is
+  // freed and the still-live supervisor starts event one.
   let assert Ok(WorkerOffer(1, _, _)) = process.receive(probe, 1000)
   assert process.is_alive(supervisor.pid)
 
