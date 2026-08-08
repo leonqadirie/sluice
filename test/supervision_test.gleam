@@ -109,6 +109,23 @@ pub fn duplicate_name_fails_to_start_test() {
   shutdown(counter)
 }
 
+// A declared subscription with demand values that are not correct must
+// fail the start, like the runtime subscribe path refuses them.
+pub fn declared_subscription_with_wrong_demand_fails_start_test() {
+  let assert Ok(counter) = counter_source() |> source.start()
+  let assert Error(actor.InitFailed(_)) =
+    sink.new(init: Nil, on_events: fn(state, _events, _subscription) {
+      sink.continue(state)
+    })
+    |> sink.subscribe(
+      sluice.subscription(to: counter.data)
+      |> sluice.min_demand(6)
+      |> sluice.max_demand(6),
+    )
+    |> sink.start()
+  shutdown(counter)
+}
+
 pub fn declared_subscription_to_missing_producer_fails_start_test() {
   let ghost_name = source.new_name("ghost")
   let assert Error(actor.InitFailed(_)) =

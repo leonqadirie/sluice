@@ -11,7 +11,9 @@ import gleam/int
 import gleam/list
 import gleam/option.{type Option, Some}
 import gleam/result
-import sluice.{type CancelMode, type SubscribeError, type Subscription}
+import sluice.{
+  type CancelMode, type DemandMode, type SubscribeError, type Subscription,
+}
 import sluice/internal/protocol.{
   type CancelReason, type ConsumerMessage, type ProducerHandle,
   type SubscribeMetadata, SubscribeMetadata,
@@ -28,6 +30,7 @@ pub type SubscriptionState(event) {
     partition: Option(Int),
     monitor: Monitor,
     cancel: CancelMode,
+    mode: DemandMode,
     min_demand: Int,
     max_demand: Int,
     /// The quantity of asked events that the consumer did not process.
@@ -64,6 +67,7 @@ pub fn add_subscription(
   min_demand min_demand: Int,
   max_demand max_demand: Int,
   cancel cancel: CancelMode,
+  mode mode: DemandMode,
   metadata metadata: SubscribeMetadata(event),
   tag_message tag_message: fn(
     Subject(ConsumerMessage(event)),
@@ -71,7 +75,15 @@ pub fn add_subscription(
   ) -> message,
   tag_down tag_down: fn(Subject(ConsumerMessage(event)), Down) -> message,
   make_cancel make_cancel: fn(Subject(ConsumerMessage(event))) -> fn() -> Nil,
+  make_ask make_ask: fn(Subject(ConsumerMessage(event))) -> fn(Int) -> Nil,
 ) -> Result(#(Core(event), Selector(message), Subscription), SubscribeError) {
+  // The runtime subscribe path checks the demand values before it sends
+  // the request. This check also covers the declared subscriptions,
+  // which do not go through that path.
+  use <- bool.guard(
+    when: min_demand < 0 || max_demand < 1 || min_demand >= max_demand,
+    return: Error(sluice.InvalidDemand(min_demand, max_demand)),
+  )
   use pid <- result.try(
     resolve_live_owner(producer)
     |> result.replace_error(sluice.ProducerNotAlive),
@@ -92,12 +104,20 @@ pub fn add_subscription(
     |> process.select_specific_monitor(monitor, fn(down) {
       tag_down(subject, down)
     })
-  let handle = sluice.make_subscription(make_cancel(subject))
+  let handle = sluice.make_subscription(make_cancel(subject), make_ask(subject))
   producer.send(protocol.Subscribe(
     from: subject,
     metadata: SubscribeMetadata(..metadata, max_demand: Some(max_demand)),
   ))
-  producer.send(protocol.Ask(from: subject, demand: max_demand))
+  // In the manual mode the consumer asks nothing by itself: the first
+  // events come after a call of `ask`.
+  let outstanding = case mode {
+    sluice.Automatic -> {
+      producer.send(protocol.Ask(from: subject, demand: max_demand))
+      max_demand
+    }
+    sluice.Manual -> 0
+  }
   let subscription =
     SubscriptionState(
       subject:,
@@ -106,9 +126,10 @@ pub fn add_subscription(
       partition: metadata.partition,
       monitor:,
       cancel:,
+      mode:,
       min_demand:,
       max_demand:,
-      outstanding: max_demand,
+      outstanding:,
       held_ask: 0,
       handle:,
       cancelling: False,
@@ -176,17 +197,30 @@ pub fn deliver(
   case dict.get(core.subscriptions, subject) {
     // The subscription is removed. Ignore this delivery.
     Error(Nil) -> #(core, state, KeepRunning)
-    Ok(subscription) ->
-      case subscription.cancelling {
-        // A cancellation is in progress. Discard these events.
-        True -> #(core, state, KeepRunning)
-        False -> {
-          let chunk_size =
-            int.max(subscription.max_demand - subscription.min_demand, 1)
-          let chunks = list.sized_chunk(events, chunk_size)
-          deliver_loop(core, subscription, chunks, state, handle_batch, can_ask)
-        }
-      }
+    Ok(subscription) -> {
+      // A cancellation in progress does not discard deliveries: the
+      // producer sent these events before it saw the cancellation, and
+      // the consumer processes all events from before the
+      // acknowledgement. Only the asks stop.
+      let chunks = divide(subscription, events)
+      deliver_loop(core, subscription, chunks, state, handle_batch, can_ask)
+    }
+  }
+}
+
+// In the manual mode the batch goes to the handler in one part: the
+// division only serves the automatic ask sequence.
+fn divide(
+  subscription: SubscriptionState(event),
+  events: List(event),
+) -> List(List(event)) {
+  case subscription.mode {
+    sluice.Manual -> [events]
+    sluice.Automatic -> {
+      let chunk_size =
+        int.max(subscription.max_demand - subscription.min_demand, 1)
+      list.sized_chunk(events, chunk_size)
+    }
   }
 }
 
@@ -250,6 +284,13 @@ fn maybe_ask(
   subscription: SubscriptionState(event),
   can_ask: Bool,
 ) -> SubscriptionState(event) {
+  // A subscription with a cancellation in progress asks for nothing.
+  use <- bool.guard(when: subscription.cancelling, return: subscription)
+  // A manual subscription never asks by itself.
+  use <- bool.guard(
+    when: subscription.mode == sluice.Manual,
+    return: subscription,
+  )
   use <- bool.guard(
     when: subscription.outstanding > subscription.min_demand,
     return: subscription,
@@ -295,6 +336,30 @@ pub fn flush_held_asks(core: Core(event)) -> Core(event) {
       },
     ),
   )
+}
+
+/// A request for more events on a manual subscription: forward the ask to
+/// the producer and record the open demand.
+pub fn request_demand(
+  core core: Core(event),
+  subject subject: Subject(ConsumerMessage(event)),
+  demand demand: Int,
+) -> Core(event) {
+  use <- bool.guard(when: demand <= 0, return: core)
+  case dict.get(core.subscriptions, subject) {
+    Error(Nil) -> core
+    Ok(subscription) -> {
+      use <- bool.guard(when: subscription.cancelling, return: core)
+      subscription.producer.send(protocol.Ask(from: subject, demand:))
+      store(
+        core,
+        SubscriptionState(
+          ..subscription,
+          outstanding: subscription.outstanding + demand,
+        ),
+      )
+    }
+  }
 }
 
 /// A local cancellation: tell the producer. Then wait for its

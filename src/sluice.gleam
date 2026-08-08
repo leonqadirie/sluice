@@ -26,6 +26,17 @@ pub type CancelMode {
   Temporary
 }
 
+/// How a subscription requests events.
+pub type DemandMode {
+  /// The consumer asks by itself: `max_demand` at the start, and again
+  /// while it processes events. This is the default.
+  Automatic
+  /// The consumer asks only when you call `ask`. Use this mode when the
+  /// consumer must control the flow, for example because it sends the
+  /// events to a different process.
+  Manual
+}
+
 /// The events that a buffer keeps when the buffer is full.
 pub type Keep {
   /// Keep the oldest events. Discard the new events.
@@ -65,7 +76,7 @@ pub opaque type Inlet(event) {
 /// A live connection between an outlet and an inlet. `subscribe` returns
 /// it. The `on_events` callbacks receive it as the source of each batch.
 pub opaque type Subscription {
-  Subscription(cancel: fn() -> Nil)
+  Subscription(cancel: fn() -> Nil, ask: fn(Int) -> Nil)
 }
 
 /// The control messages that a consumer stage accepts.
@@ -77,9 +88,11 @@ pub type ConsumerControl(event) {
     max_demand: Int,
     cancel: CancelMode,
     metadata: SubscribeMetadata(event),
+    mode: DemandMode,
     reply: Subject(Result(Subscription, SubscribeError)),
   )
   CancelSubscription(subject: Subject(ConsumerMessage(event)))
+  RequestDemand(subject: Subject(ConsumerMessage(event)), demand: Int)
 }
 
 /// The options for a connection between an inlet and an outlet. Make the
@@ -92,6 +105,7 @@ pub opaque type SubscriptionOptions(event) {
     max_demand: Int,
     cancel: CancelMode,
     metadata: SubscribeMetadata(event),
+    mode: DemandMode,
     timeout: Int,
   )
 }
@@ -107,6 +121,7 @@ pub fn subscription(to outlet: Outlet(event)) -> SubscriptionOptions(event) {
     max_demand: 1000,
     cancel: Permanent,
     metadata: protocol.default_metadata(),
+    mode: Automatic,
     timeout: 5000,
   )
 }
@@ -136,6 +151,15 @@ pub fn cancel_mode(
   cancel cancel: CancelMode,
 ) -> SubscriptionOptions(event) {
   SubscriptionOptions(..options, cancel:)
+}
+
+/// Set how the subscription requests events. The default is `Automatic`.
+/// With `Manual`, the consumer receives events only after a call of `ask`.
+pub fn demand_mode(
+  options options: SubscriptionOptions(event),
+  mode mode: DemandMode,
+) -> SubscriptionOptions(event) {
+  SubscriptionOptions(..options, mode:)
 }
 
 /// The maximum time that `subscribe` waits for the answer of the consumer
@@ -186,6 +210,7 @@ pub fn subscribe(
             max_demand: options.max_demand,
             cancel: options.cancel,
             metadata: options.metadata,
+            mode: options.mode,
             reply:,
           ))
           case process.receive(reply, options.timeout) {
@@ -211,6 +236,15 @@ pub fn cancel(subscription: Subscription) -> Nil {
   subscription.cancel()
 }
 
+/// Ask the producer of a `Manual` subscription for more events. The
+/// consumer then receives a maximum of `count` more events. You can call
+/// this function from each process, and also from inside an `on_events`
+/// callback. A call on an `Automatic` subscription adds to the demand of
+/// the automatic loop. This is usually not what you want.
+pub fn ask(subscription subscription: Subscription, count count: Int) -> Nil {
+  subscription.ask(count)
+}
+
 @internal
 pub fn make_outlet(producer: ProducerHandle(event)) -> Outlet(event) {
   Outlet(producer)
@@ -230,19 +264,30 @@ pub fn make_inlet(
 }
 
 @internal
-pub fn make_subscription(cancel: fn() -> Nil) -> Subscription {
-  Subscription(cancel:)
+pub fn make_subscription(
+  cancel: fn() -> Nil,
+  ask: fn(Int) -> Nil,
+) -> Subscription {
+  Subscription(cancel:, ask:)
 }
 
 @internal
 pub fn options_fields(
   options: SubscriptionOptions(event),
-) -> #(ProducerHandle(event), Int, Int, CancelMode, SubscribeMetadata(event)) {
+) -> #(
+  ProducerHandle(event),
+  Int,
+  Int,
+  CancelMode,
+  SubscribeMetadata(event),
+  DemandMode,
+) {
   #(
     options.producer,
     options.min_demand,
     options.max_demand,
     options.cancel,
     options.metadata,
+    options.mode,
   )
 }

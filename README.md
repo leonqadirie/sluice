@@ -147,6 +147,27 @@ let assert Ok(measurements) =
 The source sends pushed events to the consumers immediately, up to the open
 demand. The buffer keeps the remaining events.
 
+## Manual demand
+
+Some consumers must control the flow themselves, for example because they
+send the events to a different process. Set the demand mode of the
+subscription to `Manual`. The consumer then receives events only after a
+call of `sluice.ask`:
+
+```gleam
+let assert Ok(subscription) =
+  sluice.subscription(to: counter.data)
+  |> sluice.demand_mode(sluice.Manual)
+  |> sluice.subscribe(consumer: printer.data)
+
+// The consumer receives a maximum of 10 events.
+sluice.ask(subscription:, count: 10)
+```
+
+The `on_events` callback also receives the subscription. Thus a sink can
+ask for its subsequent batch from inside the callback and set its own
+speed.
+
 ## When stages stop
 
 Each subscription has a cancel mode. The cancel mode tells the consumer
@@ -220,7 +241,6 @@ the correct sequence. Each stage connects again through the names.
 
 - Broadcast dispatchers and partition dispatchers. The internal dispatcher
   interface is prepared for them.
-- Manual demand (`ask`) for consumers that must control the flow.
 - Pooled event processing, which sends batches to a group of workers.
 
 ## Inspiration

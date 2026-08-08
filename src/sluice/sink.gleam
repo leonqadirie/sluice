@@ -200,7 +200,7 @@ fn establish_declared(
   case subscriptions {
     [] -> Ok(state)
     [options, ..remaining] -> {
-      let #(producer, min_demand, max_demand, cancel, metadata) =
+      let #(producer, min_demand, max_demand, cancel, metadata, mode) =
         sluice.options_fields(options)
       case
         consumer_core.add_subscription(
@@ -210,10 +210,12 @@ fn establish_declared(
           min_demand:,
           max_demand:,
           cancel:,
+          mode:,
           metadata:,
           tag_message: FromUpstream,
           tag_down: ProducerDown,
           make_cancel: cancel_closure(state.control_subject),
+          make_ask: ask_closure(state.control_subject),
         )
       {
         Error(error) -> Error("could not subscribe: " <> string.inspect(error))
@@ -232,6 +234,16 @@ fn cancel_closure(
   }
 }
 
+fn ask_closure(
+  control_subject: Subject(sluice.ConsumerControl(event)),
+) -> fn(Subject(ConsumerMessage(event))) -> fn(Int) -> Nil {
+  fn(subject) {
+    fn(demand) {
+      process.send(control_subject, sluice.RequestDemand(subject, demand))
+    }
+  }
+}
+
 fn handle_message(
   state: State(state, event),
   message: Message(event),
@@ -243,6 +255,7 @@ fn handle_message(
       max_demand,
       cancel,
       metadata,
+      mode,
       reply,
     )) -> {
       case
@@ -253,10 +266,12 @@ fn handle_message(
           min_demand:,
           max_demand:,
           cancel:,
+          mode:,
           metadata:,
           tag_message: FromUpstream,
           tag_down: ProducerDown,
           make_cancel: cancel_closure(state.control_subject),
+          make_ask: ask_closure(state.control_subject),
         )
       {
         Error(error) -> {
@@ -271,6 +286,11 @@ fn handle_message(
     }
     Control(sluice.CancelSubscription(subject)) -> {
       let core = consumer_core.request_cancel(state.core, subject)
+      actor.continue(State(..state, core:))
+    }
+    Control(sluice.RequestDemand(subject, demand)) -> {
+      let core =
+        consumer_core.request_demand(core: state.core, subject:, demand:)
       actor.continue(State(..state, core:))
     }
     FromUpstream(subject, protocol.NewEvents(events)) -> {
