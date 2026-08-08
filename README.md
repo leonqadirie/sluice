@@ -341,9 +341,12 @@ restart tolerance, bounded shutdown, and child inspection instead.
 ## Yielders and folds
 
 `source.from_yielder` makes a source from a yielder; the source stops
-with the normal reason at the end of the yielder. A source callback can
-also end the flow itself with `source.emit_final(events)`: the last
-events go out, and then the source stops. In the other direction,
+with the normal reason at the end of the yielder. A source that you
+write yourself must end with `source.emit_final(events)`: the last
+events go out, and then the source stops. Do not wait for a later demand
+to return `source.stop()`: after a batch that does not fill the demand,
+the consumers do not ask again, and the pipeline waits without an end.
+In the other direction,
 `sink.fold` runs the full flow of an outlet through a fold and returns
 the final value:
 
