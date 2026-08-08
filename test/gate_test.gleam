@@ -225,3 +225,58 @@ pub fn gate_cannot_subscribe_to_itself_test() {
 
   shutdown(doubler)
 }
+
+// A gate that makes more events than the demand after it, with a buffer
+// limit of zero, must report the discarded events.
+pub fn gate_reports_discarded_events_test() {
+  let batch_probe = process.new_subject()
+  let discard_probe = process.new_subject()
+  let assert Ok(finite) =
+    source.new(init: False, on_demand: fn(exhausted, _demand) {
+      case exhausted {
+        True -> source.emit([], True)
+        False -> source.emit(count_up(1, 6), True)
+      }
+    })
+    |> source.start()
+  let assert Ok(expander) =
+    gate.new(init: Nil, on_events: fn(state, events, _subscription) {
+      gate.emit(
+        list.flat_map(events, fn(event) { [event, event, event] }),
+        state,
+      )
+    })
+    |> gate.buffer_capacity(events: 0)
+    |> gate.start_timeout(milliseconds: 2000)
+    |> gate.on_discard(fn(state, count) {
+      process.send(discard_probe, count)
+      state
+    })
+    |> gate.start()
+  let assert Ok(collector) =
+    sink.new(init: Nil, on_events: fn(_state, events, _subscription) {
+      let step = process.new_subject()
+      process.send(batch_probe, #(events, step))
+      let assert Ok(Nil) = process.receive(step, 10_000)
+      sink.continue(Nil)
+    })
+    |> sink.start()
+
+  let assert Ok(_) =
+    sluice.subscription(to: gate.outlet(expander.data))
+    |> small_demand
+    |> sluice.subscribe(consumer: collector.data)
+  let assert Ok(_) =
+    sluice.subscription(to: finite.data)
+    |> small_demand
+    |> sluice.subscribe(consumer: gate.inlet(expander.data))
+
+  // The gate changes 4 events into 12. The sink asked for 6. The buffer
+  // limit is 0. Thus the gate discards 6 events and reports them.
+  let assert Ok(first_discard) = process.receive(discard_probe, 1000)
+  assert first_discard > 0
+
+  shutdown(collector)
+  shutdown(expander)
+  shutdown(finite)
+}

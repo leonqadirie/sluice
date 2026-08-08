@@ -9,6 +9,7 @@ import gleam/otp/static_supervisor as supervisor
 import gleam/otp/supervision
 import sluice
 import sluice/gate
+import sluice/internal/platform
 import sluice/sink
 import sluice/source
 
@@ -169,4 +170,25 @@ pub fn supervised_pipeline_restarts_and_reconnects_test() {
   assert list.first(fresh_batch) == Ok(0)
 
   shutdown(supervised)
+}
+
+// A send to a name that has no process must not stop the sender.
+pub fn send_to_unregistered_name_is_safe_test() {
+  let name = process.new_name("no_process_here")
+  platform.send_named(name, "lost")
+
+  // A subscription to an outlet with an unregistered name fails with a
+  // clear error, without a panic.
+  let unregistered = source.new_name("also_no_process")
+  let assert Ok(collector) =
+    sink.new(init: Nil, on_events: fn(state, _events, _subscription) {
+      sink.continue(state)
+    })
+    |> sink.start_timeout(milliseconds: 2000)
+    |> sink.start()
+  assert sluice.subscription(to: source.outlet_of(unregistered))
+    |> sluice.subscribe(consumer: collector.data)
+    == Error(sluice.ProducerNotAlive)
+
+  shutdown(collector)
 }

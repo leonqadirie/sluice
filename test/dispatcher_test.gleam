@@ -1,7 +1,14 @@
+//// Tests for the dispatchers and for the demand accounts of the
+//// producer runtime.
+
 import gleam/erlang/process.{type Subject}
 import gleam/int
 import gleam/list
+import gleam/option.{None, Some}
+import sluice
+import sluice/internal/buffer
 import sluice/internal/dispatcher.{type Dispatcher, Delivery}
+import sluice/internal/producer_core
 import sluice/internal/protocol.{type ConsumerMessage}
 
 fn subscriber() -> Subject(ConsumerMessage(Int)) {
@@ -124,4 +131,112 @@ pub fn dispatch_preserves_event_order_across_subscribers_test() {
   let all_events =
     list.flat_map(result.deliveries, fn(delivery) { delivery.events })
   assert list.sort(all_events, by: int.compare) == [1, 2, 3, 4]
+}
+
+fn count_up(from: Int, count: Int) -> List(Int) {
+  int.range(from: from, to: from + count, with: [], run: list.prepend)
+  |> list.reverse
+}
+
+// A new subscriber must receive buffered events, also when the demand
+// from a cancelled subscriber absorbs its full first ask. The test drives
+// the producer runtime directly and examines the outbound messages that
+// each operation returns. Thus each step is deterministic, and no
+// messages move between processes.
+pub fn absorbed_ask_still_drains_buffer_test() {
+  let selector = process.new_selector()
+  let ignore_down = fn(_subject, _down) { Nil }
+  let core =
+    producer_core.new(
+      dispatcher: dispatcher.demand(),
+      buffer: buffer.new(capacity: buffer.Bounded(100), keep: sluice.KeepLast),
+    )
+
+  // The first subscriber asks for six events and then cancels. Its open
+  // demand stays in the dispatcher as pending demand.
+  let leaver = process.new_subject()
+  let #(core, selector, _outbound) =
+    producer_core.on_subscribe(
+      core,
+      selector,
+      leaver,
+      protocol.default_metadata(),
+      ignore_down,
+    )
+  let #(core, _outbound, unfilled) =
+    producer_core.on_ask(core:, from: leaver, demand: 6)
+  assert unfilled == 6
+  let producer_core.CancelResult(core:, selector:, ..) =
+    producer_core.on_cancel(core:, selector:, from: leaver, acknowledge: False)
+
+  // Ten events arrive while there is no subscriber: all go to the buffer.
+  let producer_core.EmitResult(core:, discarded:, ..) =
+    producer_core.emit(core:, events: count_up(1, 10))
+  assert discarded == 0
+
+  // The second subscriber asks for six events. The pending demand absorbs
+  // the full ask. The buffer must supply the recorded demand anyway.
+  let stayer = process.new_subject()
+  let #(core, _selector, _outbound) =
+    producer_core.on_subscribe(
+      core,
+      selector,
+      stayer,
+      protocol.default_metadata(),
+      ignore_down,
+    )
+  let #(core, outbound, unfilled) =
+    producer_core.on_ask(core:, from: stayer, demand: 6)
+  assert unfilled == 0
+  assert outbound
+    == [
+      producer_core.Outbound(
+        to: stayer,
+        message: protocol.NewEvents([1, 2, 3, 4, 5, 6]),
+      ),
+    ]
+
+  // The next ask is past the pending demand and takes the remaining
+  // buffered events, in sequence.
+  let #(core, outbound, _unfilled) =
+    producer_core.on_ask(core:, from: stayer, demand: 4)
+  assert outbound
+    == [
+      producer_core.Outbound(
+        to: stayer,
+        message: protocol.NewEvents([7, 8, 9, 10]),
+      ),
+    ]
+
+  // With open demand and an empty buffer, new events go out directly.
+  let #(core, outbound, unfilled) =
+    producer_core.on_ask(core:, from: stayer, demand: 4)
+  assert unfilled == 4
+  assert outbound == []
+  let producer_core.EmitResult(outbound:, ..) =
+    producer_core.emit(core:, events: [11, 12])
+  assert outbound
+    == [
+      producer_core.Outbound(to: stayer, message: protocol.NewEvents([11, 12])),
+    ]
+}
+
+// Two subscribers with different max_demand values are accepted. The
+// dispatcher only writes a warning.
+pub fn mixed_max_demand_is_accepted_test() {
+  let first = subscriber()
+  let second = subscriber()
+  let metadata_with = fn(max_demand) {
+    protocol.SubscribeMetadata(
+      selector: None,
+      partition: None,
+      max_demand: Some(max_demand),
+    )
+  }
+  let demand_dispatcher = dispatcher.demand()
+  let assert Ok(demand_dispatcher) =
+    demand_dispatcher.subscribe(first, metadata_with(6))
+  let assert Ok(demand_dispatcher) =
+    demand_dispatcher.subscribe(second, metadata_with(10))
+  assert demand_dispatcher.total_demand() == 0
 }

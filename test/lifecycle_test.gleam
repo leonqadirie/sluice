@@ -1,6 +1,6 @@
 //// Tests for the life of a subscription: each cancel mode against each
-//// type of producer stop, manual cancellation, and the isolation of the
-//// subscribers from each other.
+//// type of producer stop, manual cancellation, the subscribe and start
+//// timeouts, and the isolation of the subscribers from each other.
 
 import gleam/erlang/atom
 import gleam/erlang/process.{type ExitReason, type Monitor, type Subject}
@@ -329,4 +329,39 @@ pub fn sibling_survives_other_consumers_death_test() {
 
   shutdown(survivor)
   shutdown(counter)
+}
+
+pub fn subscribe_timeout_is_configurable_test() {
+  let batch_probe = process.new_subject()
+  let assert Ok(counter) =
+    counter_source(process.new_subject()) |> source.start()
+  let assert Ok(other) = counter_source(process.new_subject()) |> source.start()
+  let assert Ok(collector) = lockstep_sink(batch_probe) |> sink.start()
+
+  let assert Ok(_) =
+    sluice.subscription(to: counter.data)
+    |> small_demand
+    |> sluice.subscribe(consumer: collector.data)
+
+  // The sink stays in its first batch. It can not answer a second
+  // subscribe request, and the short timeout ends the wait.
+  let assert Ok(#(_events, _step)) = process.receive(batch_probe, 1000)
+  assert sluice.subscription(to: other.data)
+    |> sluice.subscribe_timeout(milliseconds: 50)
+    |> sluice.subscribe(consumer: collector.data)
+    == Error(sluice.SubscribeTimeout)
+
+  shutdown(collector)
+  shutdown(other)
+  shutdown(counter)
+}
+
+pub fn start_timeout_is_configurable_test() {
+  let assert Error(actor.InitTimeout) =
+    source.new_with_emitter(init: fn(_emitter) {
+      process.sleep(500)
+      Ok(Nil)
+    })
+    |> source.start_timeout(milliseconds: 50)
+    |> source.start()
 }
