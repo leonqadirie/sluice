@@ -419,7 +419,7 @@ fn establish_declared(
         )
       {
         Error(error) -> Error("could not subscribe: " <> string.inspect(error))
-        Ok(#(consumer, selector, _handle)) ->
+        Ok(#(consumer, selector, _subject, _handle)) ->
           establish_declared(State(..state, consumer:, selector:), remaining)
       }
     }
@@ -479,7 +479,7 @@ fn handle_message(
           process.send(reply, Error(error))
           actor.continue(state)
         }
-        Ok(#(consumer, selector, handle)) -> {
+        Ok(#(consumer, selector, _subject, handle)) -> {
           process.send(reply, Ok(handle))
           continue_with(State(..state, consumer:, selector:))
         }
@@ -498,7 +498,7 @@ fn handle_message(
         platform.monotonic_milliseconds() < deadline
       {
         True -> {
-          let #(consumer, _handle) =
+          let #(consumer, _confirmed) =
             consumer_core.confirm(core: state.consumer, reply:)
           #(consumer, state.selector)
         }

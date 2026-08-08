@@ -74,6 +74,8 @@ pub type SubscribeError {
   AlreadySubscribed
   /// The demand configuration must obey `0 <= min_demand < max_demand`.
   InvalidDemand(min_demand: Int, max_demand: Int)
+  /// This consumer owns its demand loop and does not accept manual demand.
+  UnsupportedDemandMode
   SubscribeTimeout
 }
 

@@ -388,7 +388,7 @@ pub fn cancellation_does_not_discard_deliveries_test() {
       send: fn(message) { process.send(producer_probe, message) },
       owner: fn() { Ok(helper) },
     )
-  let assert Ok(#(core, _selector, _handle)) =
+  let assert Ok(#(core, _selector, _subject, _handle)) =
     consumer_core.add_subscription(
       core,
       selector,

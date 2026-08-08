@@ -116,6 +116,9 @@ the `max_demand` values of the subscriptions before the gate.
 | `buffer_keep`       | source and gate    | `KeepLast`  |
 | `start_timeout`     | stage builders     | 5000 ms     |
 | `on_discard`        | source and gate    | log warning |
+| child restart       | consumer supervisor | `Temporary` |
+| restart tolerance   | consumer supervisor | 3 in 5 s    |
+| `shutdown_timeout`  | consumer supervisor | 5000 ms     |
 
 ### Subscription timeouts
 
@@ -284,6 +287,56 @@ let assert Ok(_) =
   |> sluice.demand_mode(sluice.Manual)
   |> sluice.subscribe(consumer: deliveries.data)
 ```
+
+For supervised event workers, use `consumer_supervisor`. It starts one linked
+OTP child for each event. `max_demand` is the maximum number of credited
+children for each subscription. A credit returns only when its child finally
+terminates; an abnormal exit followed by a transient restart keeps the same
+event and credit:
+
+```gleam
+import gleam/erlang/process
+import gleam/otp/actor
+import sluice/consumer_supervisor
+
+fn start_delivery(order: Order) -> actor.StartResult(Nil) {
+  let pid = process.spawn(fn() { deliver(order) })
+  Ok(actor.Started(pid:, data: Nil))
+}
+
+let assert Ok(deliveries) =
+  consumer_supervisor.new(start_delivery)
+  |> consumer_supervisor.restart(consumer_supervisor.Transient)
+  |> consumer_supervisor.restart_tolerance(
+    max_restarts: 3,
+    within_seconds: 5,
+  )
+  |> consumer_supervisor.start()
+
+let assert Ok(_) =
+  sluice.subscription(to: orders.data)
+  |> sluice.min_demand(4)
+  |> sluice.max_demand(8)
+  |> sluice.subscribe(consumer: consumer_supervisor.inlet(deliveries.data))
+```
+
+The child start function must return a process linked to its caller, as normal
+OTP child start functions do. Initialisation is synchronous and must finish
+quickly; the child performs the long-running work after it starts. Children
+are `Temporary` by default. `Transient` children restart only after abnormal
+exits. `Permanent` children are not supported because a successfully completed
+event must not restart.
+
+The consumer supervisor owns its demand loop, so it accepts the default
+`Automatic` mode and rejects `Manual` subscriptions. If a producer connection
+ends, existing children continue. The subscription's cancel mode then decides
+whether the consumer supervisor remains alive; when it stops, it shuts down all
+remaining children and kills children that exceed `shutdown_timeout`.
+
+`pool.sink` remains useful for lightweight best-effort work: its workers are
+unlinked, failures are logged and discarded, and each completion immediately
+asks for one replacement. `consumer_supervisor` provides OTP restart policy,
+restart tolerance, bounded shutdown, and child inspection instead.
 
 ## Yielders and folds
 

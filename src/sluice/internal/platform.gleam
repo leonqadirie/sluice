@@ -1,5 +1,6 @@
 //// Functions from the Erlang platform that the dependencies do not give.
 
+import gleam/dynamic.{type Dynamic}
 import gleam/erlang/process.{type Name}
 
 /// Send a message to a registered name. If the name has no process, or if
@@ -16,6 +17,10 @@ pub fn log_warning(message: String) -> Nil
 /// does not stop the caller.
 @external(erlang, "sluice_ffi", "safely")
 pub fn safely(run: fn() -> Nil) -> Bool
+
+/// Run a function and return a caught exception or exit as dynamic data.
+@external(erlang, "sluice_ffi", "try_call")
+pub fn try_call(run: fn() -> value) -> Result(value, Dynamic)
 
 /// A monotonic clock for timeout deadlines, in milliseconds.
 @external(erlang, "sluice_ffi", "monotonic_milliseconds")

@@ -363,7 +363,7 @@ fn establish_declared(
         )
       {
         Error(error) -> Error("could not subscribe: " <> string.inspect(error))
-        Ok(#(core, selector, handle)) -> {
+        Ok(#(core, selector, _subject, handle)) -> {
           let state = State(..state, core:, selector:)
           declared_subscribed(state:, handle:, remaining:)
         }
@@ -439,7 +439,7 @@ fn handle_message(
           process.send(reply, Error(error))
           actor.continue(state)
         }
-        Ok(#(core, selector, handle)) -> {
+        Ok(#(core, selector, _subject, handle)) -> {
           process.send(reply, Ok(handle))
           continue_with(State(..state, core:, selector:))
         }
@@ -454,32 +454,8 @@ fn handle_message(
         consumer_core.request_demand(core: state.core, subject:, demand:)
       actor.continue(State(..state, core:))
     }
-    Control(sluice.ConfirmSubscribe(reply, confirmed, deadline)) -> {
-      let #(core, selector, handle) = case
-        platform.monotonic_milliseconds() < deadline
-      {
-        True -> {
-          let #(core, handle) = consumer_core.confirm(core: state.core, reply:)
-          #(core, state.selector, handle)
-        }
-        False -> {
-          let #(core, selector) =
-            consumer_core.abandon(state.core, state.selector, reply)
-          #(core, selector, None)
-        }
-      }
-      let state = State(..state, core:, selector:)
-      case handle {
-        None -> {
-          process.send(confirmed, Nil)
-          continue_with(state)
-        }
-        Some(handle) -> {
-          process.send(confirmed, Nil)
-          apply_next(state, state.on_subscribed(state.user_state, handle))
-        }
-      }
-    }
+    Control(sluice.ConfirmSubscribe(reply, confirmed, deadline)) ->
+      confirm_subscription(state:, reply:, confirmed:, deadline:)
     Control(sluice.AbandonSubscribe(reply)) -> {
       let #(core, selector) =
         consumer_core.abandon(state.core, state.selector, reply)
@@ -515,6 +491,35 @@ fn handle_message(
         process.PortDown(..) -> actor.continue(state)
       }
     FromUser(apply) -> apply_next(state, apply(state.user_state))
+  }
+}
+
+fn confirm_subscription(
+  state state: State(state, event),
+  reply reply: Subject(Result(Subscription, sluice.SubscribeError)),
+  confirmed confirmed: Subject(Nil),
+  deadline deadline: Int,
+) -> actor.Next(State(state, event), Message(state, event)) {
+  let #(core, selector, handle) = case
+    platform.monotonic_milliseconds() < deadline
+  {
+    True -> {
+      let #(core, confirmed) = consumer_core.confirm(core: state.core, reply:)
+      let handle = option.map(confirmed, fn(pair) { pair.1 })
+      #(core, state.selector, handle)
+    }
+    False -> {
+      let #(core, selector) =
+        consumer_core.abandon(state.core, state.selector, reply)
+      #(core, selector, None)
+    }
+  }
+  let state = State(..state, core:, selector:)
+  process.send(confirmed, Nil)
+  case handle {
+    None -> continue_with(state)
+    Some(handle) ->
+      apply_next(state, state.on_subscribed(state.user_state, handle))
   }
 }
 
