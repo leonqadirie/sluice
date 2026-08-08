@@ -82,16 +82,22 @@ pub opaque type Name(event, child_data) {
 
 /// Make a permanent name. Create names during application start, not inside
 /// a dynamic loop.
+///
+/// * `prefix`: The readable prefix of the name.
 pub fn new_name(prefix prefix: String) -> Name(event, child_data) {
   Name(process.new_name(prefix))
 }
 
 /// Find the process currently using a name.
+///
+/// * `name`: The name of the supervisor.
 pub fn whereis(name: Name(event, child_data)) -> Result(Pid, Nil) {
   process.named(name.name)
 }
 
 /// Make a reference to the process using a name.
+///
+/// * `name`: The name of the supervisor.
 pub fn supervisor_of(
   name: Name(event, child_data),
 ) -> Supervisor(event, child_data) {
@@ -100,11 +106,15 @@ pub fn supervisor_of(
 }
 
 /// Get the input face of a named supervisor.
+///
+/// * `name`: The name of the supervisor.
 pub fn inlet_of(name: Name(event, child_data)) -> Inlet(event) {
   supervisor_of(name).inlet
 }
 
 /// Get the input face of a running supervisor.
+///
+/// * `supervisor`: The supervisor, from `start` or `supervisor_of`.
 pub fn inlet(supervisor: Supervisor(event, child_data)) -> Inlet(event) {
   supervisor.inlet
 }
@@ -124,6 +134,9 @@ pub opaque type Builder(event, child_data) {
 }
 
 /// Define a consumer supervisor. Children are temporary by default.
+///
+/// * `start_child`: The function that starts one linked child for one
+///   event. It must follow the OTP child contract.
 pub fn new(
   start_child start_child: fn(event) -> actor.StartResult(child_data),
 ) -> Builder(event, child_data) {
@@ -140,6 +153,9 @@ pub fn new(
 }
 
 /// Set the child restart policy.
+///
+/// * `builder`: The builder to change.
+/// * `policy`: The `Restart` policy for the children.
 pub fn restart(
   builder builder: Builder(event, child_data),
   policy policy: Restart,
@@ -148,6 +164,10 @@ pub fn restart(
 }
 
 /// Set the maximum child restarts allowed during a period in seconds.
+///
+/// * `builder`: The builder to change.
+/// * `max_restarts`: The maximum quantity of restarts in the period.
+/// * `within_seconds`: The length of the period in seconds.
 pub fn restart_tolerance(
   builder builder: Builder(event, child_data),
   max_restarts max_restarts: Int,
@@ -161,6 +181,9 @@ pub fn restart_tolerance(
 }
 
 /// Set how long children have to stop before they are killed.
+///
+/// * `builder`: The builder to change.
+/// * `milliseconds`: The maximum stop time in milliseconds.
 pub fn shutdown_timeout(
   builder builder: Builder(event, child_data),
   milliseconds milliseconds: Int,
@@ -169,6 +192,9 @@ pub fn shutdown_timeout(
 }
 
 /// Set the maximum time allowed for supervisor initialisation.
+///
+/// * `builder`: The builder to change.
+/// * `milliseconds`: The maximum start time in milliseconds.
 pub fn start_timeout(
   builder builder: Builder(event, child_data),
   milliseconds milliseconds: Int,
@@ -179,6 +205,9 @@ pub fn start_timeout(
 /// Declare a subscription that is established when the supervisor starts.
 /// Consumer supervisors own their demand loop, so the subscription must use
 /// the default `Automatic` demand mode.
+///
+/// * `builder`: The builder to change.
+/// * `options`: The subscription options, from `sluice.subscription`.
 pub fn subscribe(
   builder builder: Builder(event, child_data),
   options options: SubscriptionOptions(event),
@@ -187,6 +216,9 @@ pub fn subscribe(
 }
 
 /// Give the supervisor a permanent name.
+///
+/// * `builder`: The builder to change.
+/// * `name`: The name, from `new_name`.
 pub fn named(
   builder builder: Builder(event, child_data),
   name name: Name(event, child_data),
@@ -195,6 +227,8 @@ pub fn named(
 }
 
 /// Start the supervisor as a linked OTP child.
+///
+/// * `builder`: The configuration of the supervisor.
 pub fn start(
   builder: Builder(event, child_data),
 ) -> actor.StartResult(Supervisor(event, child_data)) {
@@ -213,6 +247,9 @@ pub fn start(
 
 /// Ask a child to stop. Successfully terminated event children return one
 /// demand credit to their producer.
+///
+/// * `supervisor`: The supervisor that owns the child.
+/// * `pid`: The pid of the child.
 pub fn terminate_child(
   supervisor supervisor: Supervisor(event, child_data),
   pid pid: Pid,
@@ -224,6 +261,8 @@ pub fn terminate_child(
 }
 
 /// Return the supervisor's current children.
+///
+/// * `supervisor`: The supervisor to query.
 pub fn which_children(
   supervisor: Supervisor(event, child_data),
 ) -> Result(List(Child), Nil) {
@@ -233,6 +272,8 @@ pub fn which_children(
 }
 
 /// Return child counts.
+///
+/// * `supervisor`: The supervisor to query.
 pub fn count_children(
   supervisor: Supervisor(event, child_data),
 ) -> Result(ChildrenCount, Nil) {

@@ -143,6 +143,8 @@ pub opaque type SubscriptionOptions(event) {
 /// default options are: `min_demand` 750, `max_demand` 1000, the
 /// `Permanent` cancel mode, and a `subscribe_timeout` of 5000
 /// milliseconds.
+///
+/// * `outlet`: The outlet to subscribe to.
 pub fn subscription(to outlet: Outlet(event)) -> SubscriptionOptions(event) {
   SubscriptionOptions(
     producer: outlet.producer,
@@ -158,6 +160,9 @@ pub fn subscription(to outlet: Outlet(event)) -> SubscriptionOptions(event) {
 /// The consumer asks the producer for more events when the open demand
 /// decreases to this value or less. The value must be 0 or more, and less
 /// than `max_demand`.
+///
+/// * `options`: The subscription options to change.
+/// * `min_demand`: The demand value at which the consumer asks again.
 pub fn min_demand(
   options options: SubscriptionOptions(event),
   min_demand min_demand: Int,
@@ -168,6 +173,9 @@ pub fn min_demand(
 /// The maximum open demand of this subscription. The open demand is the
 /// quantity of events that the consumer asked for and did not process. The
 /// value must be 1 or more.
+///
+/// * `options`: The subscription options to change.
+/// * `max_demand`: The maximum open demand of the subscription.
 pub fn max_demand(
   options options: SubscriptionOptions(event),
   max_demand max_demand: Int,
@@ -175,6 +183,10 @@ pub fn max_demand(
   SubscriptionOptions(..options, max_demand:)
 }
 
+/// Set the cancel mode of the subscription. The default is `Permanent`.
+///
+/// * `options`: The subscription options to change.
+/// * `cancel`: The `CancelMode` of the subscription.
 pub fn cancel_mode(
   options options: SubscriptionOptions(event),
   cancel cancel: CancelMode,
@@ -185,6 +197,10 @@ pub fn cancel_mode(
 /// Select the partition of this subscription. Only a producer with a
 /// partition dispatcher reads this value. Such a producer refuses a
 /// subscription without a partition.
+///
+/// * `options`: The subscription options to change.
+/// * `index`: The partition of this subscription, from 0 to the partition
+///   count of the dispatcher - 1.
 pub fn partition(
   options options: SubscriptionOptions(event),
   index index: Int,
@@ -201,6 +217,10 @@ pub fn partition(
 /// Give the subscription an event filter. Only a producer with a
 /// broadcast dispatcher reads this value: the subscriber receives only
 /// the events for which `keep` returns `True`.
+///
+/// * `options`: The subscription options to change.
+/// * `keep`: The filter. It examines one event and returns `True` when
+///   the subscriber must receive the event.
 pub fn selector(
   options options: SubscriptionOptions(event),
   keep keep: fn(event) -> Bool,
@@ -216,6 +236,9 @@ pub fn selector(
 
 /// Set how the subscription requests events. The default is `Automatic`.
 /// With `Manual`, the consumer receives events only after a call of `ask`.
+///
+/// * `options`: The subscription options to change.
+/// * `mode`: The `DemandMode` of the subscription.
 pub fn demand_mode(
   options options: SubscriptionOptions(event),
   mode mode: DemandMode,
@@ -231,6 +254,9 @@ pub fn demand_mode(
 /// subscription or initial demand is sent to the producer, and the consumer's
 /// `on_subscribed` and `on_cancelled` callbacks are not called for it. It is
 /// safe to retry the subscription.
+///
+/// * `options`: The subscription options to change.
+/// * `milliseconds`: The maximum wait time in milliseconds.
 pub fn subscribe_timeout(
   options options: SubscriptionOptions(event),
   milliseconds milliseconds: Int,
@@ -250,6 +276,9 @@ pub fn subscribe_timeout(
 /// withdrawn and cannot become live later. See `subscribe_timeout`.
 ///
 /// This compiles only when the two stages have the same event type.
+///
+/// * `options`: The subscription options, from `subscription`.
+/// * `inlet`: The inlet of the consumer stage.
 pub fn subscribe(
   options options: SubscriptionOptions(event),
   consumer inlet: Inlet(event),
@@ -324,6 +353,8 @@ fn inlet_alive(inlet: Inlet(event)) -> Bool {
 /// `source.accumulate_demand` configured. The source then replays the
 /// held asks and starts to make events. A source without accumulation
 /// ignores this call.
+///
+/// * `outlet`: The outlet of the source.
 pub fn forward_demand(outlet outlet: Outlet(event)) -> Nil {
   outlet.producer.send(protocol.ForwardDemand)
 }
@@ -331,6 +362,8 @@ pub fn forward_demand(outlet outlet: Outlet(event)) -> Nil {
 /// Cancel a subscription. The consumer disconnects from the producer. Then
 /// the consumer applies its cancel mode. Thus, if you cancel a `Permanent`
 /// subscription, the consumer stage stops.
+///
+/// * `subscription`: The subscription to cancel.
 pub fn cancel(subscription: Subscription) -> Nil {
   subscription.cancel()
 }
@@ -340,6 +373,10 @@ pub fn cancel(subscription: Subscription) -> Nil {
 /// this function from each process, and also from inside an `on_events`
 /// callback. A call on an `Automatic` subscription adds to the demand of
 /// the automatic loop. This is usually not what you want.
+///
+/// * `subscription`: The subscription through which to ask.
+/// * `count`: The maximum quantity of new events that the consumer
+///   receives for this ask.
 pub fn ask(subscription subscription: Subscription, count count: Int) -> Nil {
   subscription.ask(count)
 }

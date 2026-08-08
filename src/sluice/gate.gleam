@@ -34,6 +34,9 @@ pub opaque type Transform(state, out) {
 /// Emit the changed events. The quantity of output events is free. A
 /// filter makes fewer events. An expander makes more events. The buffer
 /// keeps the events that are more than the demand after the gate.
+///
+/// * `events`: The changed events.
+/// * `state`: The new state of the gate.
 pub fn emit(
   events events: List(out),
   state state: state,
@@ -47,6 +50,8 @@ pub fn stop() -> Transform(state, out) {
 }
 
 /// Stop the gate with a failure reason.
+///
+/// * `reason`: The description of the failure.
 pub fn stop_abnormal(reason: String) -> Transform(state, out) {
   StopAbnormal(reason)
 }
@@ -57,10 +62,16 @@ pub opaque type Gate(in, out) {
   Gate(inlet: Inlet(in), outlet: Outlet(out))
 }
 
+/// The input face of the gate.
+///
+/// * `gate`: The gate, from `start`.
 pub fn inlet(gate: Gate(in, out)) -> Inlet(in) {
   gate.inlet
 }
 
+/// The output face of the gate.
+///
+/// * `gate`: The gate, from `start`.
 pub fn outlet(gate: Gate(in, out)) -> Outlet(out) {
   gate.outlet
 }
@@ -78,17 +89,25 @@ pub opaque type Name(in, out) {
   Name(name: process.Name(NamedMessage(in, out)))
 }
 
+/// Make a permanent name. Create names during application start, not
+/// inside a dynamic loop.
+///
+/// * `prefix`: The readable prefix of the name.
 pub fn new_name(prefix prefix: String) -> Name(in, out) {
   Name(process.new_name(prefix))
 }
 
 /// The process that has this name now, if a process has it.
+///
+/// * `name`: The name of the gate.
 pub fn whereis(name: Name(in, out)) -> Result(process.Pid, Nil) {
   process.named(name.name)
 }
 
 /// The input face of the gate that has this name. It stays correct through
 /// restarts.
+///
+/// * `name`: The name of the gate.
 pub fn inlet_of(name: Name(in, out)) -> Inlet(in) {
   sluice.make_inlet(
     fn(control) { send_named(name, NamedControl(control)) },
@@ -98,6 +117,8 @@ pub fn inlet_of(name: Name(in, out)) -> Inlet(in) {
 
 /// The output face of the gate that has this name. It stays correct
 /// through restarts.
+///
+/// * `name`: The name of the gate.
 pub fn outlet_of(name: Name(in, out)) -> Outlet(out) {
   sluice.make_outlet(
     protocol.ProducerHandle(
@@ -132,6 +153,11 @@ pub opaque type Builder(state, in, out) {
 
 /// Define a gate. The handler receives each batch and the subscription
 /// that supplied the batch. The handler returns the changed events.
+///
+/// * `state`: The first state of the gate.
+/// * `on_events`: The batch handler. It receives the state, one batch of
+///   events, and the subscription that supplied the batch, and it returns
+///   a `Transform` with the changed events.
 pub fn new(
   init state: state,
   on_events on_events: fn(state, List(in), Subscription) ->
@@ -165,6 +191,10 @@ fn default_on_discard(state: state, count: Int) -> state {
 /// Set the response of the gate to discarded events. The callback receives
 /// the state and the quantity of discarded events. The default response
 /// writes a warning to the log.
+///
+/// * `builder`: The builder to change.
+/// * `on_discard`: The callback. It receives the state and the quantity
+///   of discarded events, and it returns the new state.
 pub fn on_discard(
   builder: Builder(state, in, out),
   on_discard: fn(state, Int) -> state,
@@ -174,6 +204,10 @@ pub fn on_discard(
 
 /// Set a hook that runs when a subscriber arrives at the gate or leaves
 /// it.
+///
+/// * `builder`: The builder to change.
+/// * `on_subscribers`: The hook. It receives the state and the
+///   `SubscriberChange`, and it returns the new state.
 pub fn on_subscribers(
   builder: Builder(state, in, out),
   on_subscribers: fn(state, sluice.SubscriberChange) -> state,
@@ -182,6 +216,9 @@ pub fn on_subscribers(
 }
 
 /// Set the dispatcher of the gate. The default is the demand dispatcher.
+///
+/// * `builder`: The builder to change.
+/// * `dispatcher`: The dispatcher of the gate.
 pub fn dispatcher(
   builder builder: Builder(state, in, out),
   dispatcher dispatcher: Dispatcher(out),
@@ -195,6 +232,12 @@ pub fn dispatcher(
 /// handler receives each message together with the state, and it can emit
 /// events to the stages after the gate. Use this for timers, for
 /// configuration changes, and for queries.
+///
+/// * `builder`: The builder to change.
+/// * `initialise`: The function that receives the subject of the channel
+///   at the start of the gate.
+/// * `handler`: The message handler. It receives the state and one
+///   message, and it returns a `Transform`.
 pub fn on_message(
   builder: Builder(state, in, out),
   initialise initialise: fn(Subject(user_message)) -> Nil,
@@ -215,6 +258,9 @@ pub fn on_message(
 
 /// The maximum time for the start of the gate, which includes its declared
 /// subscriptions. The default is 5000 milliseconds.
+///
+/// * `builder`: The builder to change.
+/// * `milliseconds`: The maximum start time in milliseconds.
 pub fn start_timeout(
   builder builder: Builder(state, in, out),
   milliseconds milliseconds: Int,
@@ -227,6 +273,9 @@ pub fn start_timeout(
 /// a dead producer, a duplicate, a subscription to itself, and demand
 /// values that are not correct. A refusal from the dispatcher of the
 /// producer comes later as an abnormal end of the subscription.
+///
+/// * `builder`: The builder to change.
+/// * `options`: The subscription options, from `sluice.subscription`.
 pub fn subscribe(
   builder builder: Builder(state, in, out),
   options options: SubscriptionOptions(in),
@@ -238,6 +287,9 @@ pub fn subscribe(
 /// The demand connection between the two faces keeps the buffer small. The
 /// maximum content is approximately the sum of the `max_demand` values of
 /// the subscriptions before the gate. Thus the gate discards nothing.
+///
+/// * `builder`: The builder to change.
+/// * `capacity`: The maximum quantity of events in the buffer.
 pub fn buffer_capacity(
   builder builder: Builder(state, in, out),
   events capacity: Int,
@@ -246,6 +298,9 @@ pub fn buffer_capacity(
 }
 
 /// Select the events that stay when a buffer with a limit is full.
+///
+/// * `builder`: The builder to change.
+/// * `keep`: The `Keep` selection.
 pub fn buffer_keep(
   builder builder: Builder(state, in, out),
   keep keep: Keep,
@@ -254,6 +309,9 @@ pub fn buffer_keep(
 }
 
 /// Attach a permanent name to the gate at its start.
+///
+/// * `builder`: The builder to change.
+/// * `name`: The name, from `new_name`.
 pub fn named(
   builder builder: Builder(state, in, out),
   name name: Name(in, out),
@@ -288,6 +346,8 @@ type State(state, in, out) {
 
 /// Start the gate. The returned data is the pair of faces. Connect them
 /// with `inlet` and `outlet`.
+///
+/// * `builder`: The configuration of the gate.
 pub fn start(
   builder: Builder(state, in, out),
 ) -> Result(actor.Started(Gate(in, out)), actor.StartError) {
