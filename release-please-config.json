@@ -1,0 +1,17 @@
+{
+  "include-commit-authors": true,
+  "packages": {
+    ".": {
+      "release-type": "simple",
+      "bump-minor-pre-major": true,
+      "draft": false,
+      "changelog-type": "default",
+      "extra-files": [
+        {
+          "type": "generic",
+          "path": "gleam.toml"
+        }
+      ]
+    }
+  }
+}

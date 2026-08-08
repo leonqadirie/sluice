@@ -1,5 +1,5 @@
 name = "sluice"
-version = "0.1.0"
+version = "0.1.0" # x-release-please-version
 description = "Stage pipelines for Gleam, with demand control and backpressure"
 licences = ["Apache-2.0"]
 repository = { type = "github", user = "leonqadirie", repo = "sluice" }
