@@ -80,6 +80,19 @@ pub fn main() -> Nil {
 }
 ```
 
+## Examples
+
+The [`example`](example) directory contains one runnable module for
+each pattern: the basic pipeline, pushed events and buffer overflow, a
+broadcast with a filter, partitions, a worker pool, supervised event
+workers, and a pipeline under a supervisor. Run one from that
+directory:
+
+```sh
+cd example
+gleam run --module counter_pipeline
+```
+
 ## Demand
 
 When an inlet subscribes to an outlet, the consumer immediately asks for
