@@ -56,7 +56,7 @@ sink of `String`, you get a compile error.
 
 <!-- x-release-please-start-major -->
 ```sh
-gleam add sluice@0
+gleam add sluice@1
 ```
 <!-- x-release-please-end -->
 
