@@ -5,19 +5,52 @@
 
 Stage pipelines for Gleam, with demand control and backpressure.
 
-A pipeline has three types of stages:
+A pipeline is a chain of stages that events flow through. There are three
+kinds of stages:
 
-- A **Source** makes events.
-- A **Gate** changes events.
-- A **Sink** uses events.
+- A **Source** produces events.
+- A **Gate** receives events, transforms them, and passes them on. A gate
+  can emit zero, one, or many events for each event it receives, so gates
+  can also filter, expand, and aggregate.
+- A **Sink** consumes events.
 
-Events move only when the consumer side asks for them. Thus a slow sink
-decreases the speed of all stages before it. Mailboxes do not grow without a
-limit. Events are not lost. You do not poll.
+Events flow forward through the pipeline. Demand flows backward:
 
-The compiler examines each connection. An `Outlet(event)` can connect only
-to an `Inlet` that has the same event type. If you connect a source of `Int`
-to a sink of `String`, you get a compile error.
+```
+events:   Source ──▶ Gate ──▶ Sink
+demand:   Source ◀── Gate ◀── Sink
+```
+
+Nothing moves until the consuming side asks for events. Because of this, a
+slow sink slows down every stage before it, mailboxes stay bounded, and
+you never need to poll. No event is dropped silently: a stage that must
+drop events logs a warning first.
+
+## When to use sluice
+
+Use sluice when events keep arriving and handling them is slower than
+their arrival — packets from a socket, jobs from a queue, readings from
+sensors. Without demand control, a fast producer fills a slow consumer's
+mailbox until memory runs out. With sluice, the consumer asks for exactly
+as much as it can handle, and that limit travels backward through every
+stage to the source.
+
+You don't need sluice for a one-off parallel computation over data you
+already have in memory; spawning ordinary processes is simpler. Reach for
+sluice when the stages are long-lived processes and the data never stops.
+
+## Outlets and inlets
+
+Every connection runs from an **outlet** to an **inlet**. An outlet is
+the face of a stage that provides events. An inlet is the face that
+receives them. A source has only an outlet and a sink has only an inlet,
+so you pass their handles (`counter.data`, `printer.data` below) straight
+to `subscribe`. A gate has both faces, so you pick one with
+`gate.outlet(...)` or `gate.inlet(...)`.
+
+The compiler checks every connection: an `Outlet(event)` only connects to
+an `Inlet` of the same event type. If you connect a source of `Int` to a
+sink of `String`, you get a compile error.
 
 ## Quick start
 
@@ -38,8 +71,8 @@ import sluice/sink
 import sluice/source
 
 pub fn main() -> Nil {
-  // This source counts up. It makes only the events that the demand asks
-  // for.
+  // This source counts up. It only produces the events that consumers
+  // ask for.
   let assert Ok(counter) =
     source.new(init: 0, on_demand: fn(counter, demand) {
       let events =
@@ -49,14 +82,14 @@ pub fn main() -> Nil {
     })
     |> source.start()
 
-  // This gate multiplies each event by two.
+  // This gate doubles each event.
   let assert Ok(doubler) =
     gate.new(init: Nil, on_events: fn(state, events, _subscription) {
       gate.emit(list.map(events, fn(event) { event * 2 }), state)
     })
     |> gate.start()
 
-  // This sink prints slowly. Thus it decreases the speed of the full
+  // This sink prints slowly, so it sets the pace for the whole
   // pipeline.
   let assert Ok(printer) =
     sink.new(init: Nil, on_events: fn(state, events, _subscription) {
@@ -82,11 +115,10 @@ pub fn main() -> Nil {
 
 ## Examples
 
-The [`example`](example) directory contains one runnable module for
-each pattern: the basic pipeline, pushed events and buffer overflow, a
+The [`example`](example) directory contains one runnable module for each
+pattern: the basic pipeline, pushed events and buffer overflow, a
 broadcast with a filter, partitions, a worker pool, supervised event
-workers, and a pipeline under a supervisor. Run one from that
-directory:
+workers, and a pipeline under a supervisor. Run one from that directory:
 
 ```sh
 cd example
@@ -96,25 +128,44 @@ gleam run --module counter_pipeline
 ## Demand
 
 When an inlet subscribes to an outlet, the consumer immediately asks for
-`max_demand` events. The consumer then processes events in batches. When the
-open demand decreases to `min_demand`, the consumer asks again. Thus the
-producer makes events while the consumer processes events. The open demand
-of a subscription is never more than `max_demand`.
+`max_demand` events. Delivered events reach the `on_events` callback in
+batches of `max_demand - min_demand`. After each batch, the consumer
+checks its open demand — the number of events it has asked for but not
+yet processed. When open demand falls to `min_demand` or below, the
+consumer asks for enough events to bring it back up to `max_demand`.
 
-A source can make more events than the demand. This is not an error. The
-source keeps the extra events in its buffer. The buffer supplies the
-subsequent demand before the source makes new events. The default buffer
-limit is 10,000 events. When the buffer is full, the overflow policy
-applies. `KeepLast` (the default) discards the oldest events. `KeepFirst`
-discards the new events. When a stage discards events, it writes a warning
-to the log. Set a different response with `on_discard`.
+Here is the cycle with the defaults, `max_demand: 1000` and
+`min_demand: 750`:
 
-A gate connects its two faces. The gate asks the stages before it for more
-events only in one of two conditions: the stages after it ask for events,
-or the gate buffer is empty. Thus backpressure moves through the full
-pipeline. The gate buffer has no default limit. The demand connection keeps
-the buffer small. The maximum buffer content is approximately the sum of
-the `max_demand` values of the subscriptions before the gate.
+1. The consumer subscribes and asks for 1,000 events.
+2. The producer sends 1,000 events. The consumer processes them in
+   batches of 250 (`max_demand - min_demand`).
+3. After the first batch, open demand is down to 750, so the consumer
+   asks for 250 more.
+4. The producer creates new events while the consumer works through the
+   remaining batches. The cycle repeats after every batch.
+
+Producer and consumer work at the same time, and open demand never rises
+above `max_demand`. To tune a subscription: use a small `max_demand`
+(down to 1) when each event is expensive to process, and a large one when
+events are cheap and you want fewer messages between stages.
+
+A source may produce more events than were asked for. That's fine: the
+source keeps the extra events in its buffer and serves later demand from
+the buffer before it produces anything new. The default buffer holds
+10,000 events. When the buffer is full, the overflow policy decides what
+to drop: `KeepLast` (the default) drops the oldest events, `KeepFirst`
+drops the new ones. A stage that drops events logs a warning; set a
+different response with `on_discard`. Buffering also works in the other
+direction: a producer that receives demand before it has events remembers
+that demand and fills it as soon as events appear.
+
+A gate connects its two faces. It asks the stages before it for more
+events only when the stages after it ask, or when its own buffer is
+empty. That is how backpressure travels through the whole pipeline. The
+gate buffer has no size limit, but the demand cycle keeps it small: it
+never holds much more than the sum of the `max_demand` values of the
+subscriptions feeding the gate.
 
 ## Defaults
 
@@ -135,23 +186,23 @@ the `max_demand` values of the subscriptions before the gate.
 
 ### Subscription timeouts
 
-`subscribe` waits for the consumer stage for at most `subscribe_timeout`.
-When that time expires, it returns `Error(SubscribeTimeout)` and withdraws
-the request. The request cannot become a live subscription later: Sluice
-does not send its subscription or initial demand to the producer, and does
-not call the consumer's `on_subscribed` or `on_cancelled` callbacks for it.
-It is therefore safe to retry the subscription.
+`subscribe` waits for the consumer stage for up to `subscribe_timeout`.
+If time runs out, it returns `Error(SubscribeTimeout)` and withdraws the
+request. The request can't become a live subscription later: sluice does
+not send its subscription or initial demand to the producer, and does not
+call the consumer's `on_subscribed` or `on_cancelled` callbacks for it.
+It's safe to retry the subscription.
 
-A successful `subscribe` means that the consumer sent the subscription to
-the producer. Producer acceptance remains asynchronous; for example, a
-dispatcher refusal arrives later as an abnormal end of the subscription.
+A successful `subscribe` means the consumer sent the subscription to the
+producer. The producer's acceptance is still asynchronous — for example,
+a dispatcher's refusal arrives later as an abnormal end of the
+subscription.
 
 ## Push events from outside
 
-Some sources cannot make events on request. Their events come from a
-socket, from a timer, or from a different process. `source.new_with_emitter`
-gives an `Emitter` to the initialiser. Each process can push events through
-the `Emitter`:
+Some sources can't produce events on request. Their events come from a
+socket, a timer, or another process. `source.new_with_emitter` passes an
+`Emitter` to the initialiser, and any process can push events through it:
 
 ```gleam
 let assert Ok(measurements) =
@@ -162,27 +213,26 @@ let assert Ok(measurements) =
   |> source.start()
 ```
 
-The source sends pushed events to the consumers immediately, up to the open
-demand. The buffer keeps the remaining events.
+The source sends pushed events to its consumers right away, up to the
+open demand. The buffer holds the rest.
 
 ## Dispatchers
 
-A dispatcher decides which subscriber of a source or a gate receives
-which events. Set it with the `dispatcher` builder function; there are
-three:
+A dispatcher decides which subscriber of a source or gate receives which
+events. Set it with the `dispatcher` builder function. There are three:
 
 - `dispatcher.demand()` (the default): each event goes to exactly one
-  subscriber, the one with the largest open demand. Thus the load becomes
-  equal across the subscribers with time.
-- `dispatcher.broadcast()`: each event goes to each subscriber, at the
-  speed of the slowest subscriber. A subscriber can set a filter with
+  subscriber — the one with the most open demand. Over time this spreads
+  the load evenly across subscribers.
+- `dispatcher.broadcast()`: each event goes to every subscriber, at the
+  pace of the slowest one. A subscriber can set a filter with
   `sluice.selector(keep: fn(event) { ... })`; it then receives only the
-  events that the filter keeps.
-- `dispatcher.partition(count:, by:)`: the `by` function gives each event
-  a partition, and each partition has a maximum of one subscriber. A
-  subscriber selects its partition with `sluice.partition(index:)`.
-  Events for a partition without open demand wait in a queue for that
-  partition; thus a slow partition does not stop the other partitions.
+  events the filter keeps.
+- `dispatcher.partition(count:, by:)`: the `by` function assigns each
+  event to a partition, and each partition has at most one subscriber. A
+  subscriber picks its partition with `sluice.partition(index:)`. Events
+  for a partition without open demand wait in that partition's queue, so
+  a slow partition doesn't block the others.
 
 ```gleam
 import sluice/dispatcher
@@ -197,27 +247,26 @@ let assert Ok(measurements) =
 
 ## Subscription hooks
 
-A producer stage can see its subscriber group: `on_subscribers` runs when
-a subscriber arrives or leaves, with the new quantity of subscribers. Use
-it to start work at the first subscriber and to stop work at the last
-one. A sink has two hooks: `on_subscribed` receives each new
-`Subscription`, and `on_cancelled` runs when a subscription ends. When
-`on_cancelled` is set, it decides what the sink does, and the cancel mode
-does not apply.
+A producer stage can watch its subscriber group: `on_subscribers` runs
+whenever a subscriber arrives or leaves, with the new subscriber count.
+Use it to start work when the first subscriber appears and to stop work
+when the last one leaves. A sink has two hooks: `on_subscribed` receives
+each new `Subscription`, and `on_cancelled` runs when a subscription
+ends. When `on_cancelled` is set, it decides what the sink does, and the
+cancel mode no longer applies.
 
 ## Accumulate demand at the start
 
-A source with `accumulate_demand` holds the incoming asks and makes no
-events. A call of `sluice.forward_demand(outlet:)` releases the held
-asks. Use this to connect a full pipeline before the events start to
-move.
+A source with `accumulate_demand` holds incoming asks and produces
+nothing. Calling `sluice.forward_demand(outlet:)` releases the held asks.
+Use this to wire up a whole pipeline before any events start to move.
 
 ## Manual demand
 
-Some consumers must control the flow themselves, for example because they
-send the events to a different process. Set the demand mode of the
-subscription to `Manual`. The consumer then receives events only after a
-call of `sluice.ask`:
+Some consumers must control the flow themselves — for example, because
+they forward events to another process. Set the subscription's demand
+mode to `Manual`. The consumer then receives events only after you call
+`sluice.ask`:
 
 ```gleam
 let assert Ok(subscription) =
@@ -225,23 +274,21 @@ let assert Ok(subscription) =
   |> sluice.demand_mode(sluice.Manual)
   |> sluice.subscribe(consumer: printer.data)
 
-// The consumer receives a maximum of 10 events.
+// The consumer receives at most 10 events.
 sluice.ask(subscription:, count: 10)
 ```
 
-The `on_events` callback also receives the subscription. Thus a sink can
-ask for its subsequent batch from inside the callback and set its own
-speed.
+The `on_events` callback also receives the subscription, so a sink can
+ask for its next batch from inside the callback and set its own pace.
 
 ## Send messages to a stage
 
-A stage can receive messages of a type of your choice, next to the event
-flow. Use this for timers, for configuration changes, and for queries.
-Give the stage a message channel with `on_message`. At the start, the
-`initialise` callback receives the subject of the channel. The handler
-receives each message together with the state, and it has the full
-vocabulary of the stage. Thus a source or a gate can emit events from
-it:
+A stage can receive messages of any type you choose, alongside the event
+flow. Use this for timers, configuration changes, and queries. Give the
+stage a message channel with `on_message`. At startup, the `initialise`
+callback receives the channel's subject. The handler receives each
+message together with the state, and it can do everything the stage can
+do — a source or a gate can emit events from it:
 
 ```gleam
 let assert Ok(prices) =
@@ -266,28 +313,27 @@ let assert Ok(prices) =
 
 ## When stages stop
 
-Each subscription has a cancel mode. The cancel mode tells the consumer
-stage what to do when the subscription stops. A subscription stops when the
-producer stops, when the producer fails, or when you cancel the
-subscription:
+Every subscription has a cancel mode, which tells the consumer stage what
+to do when the subscription ends. A subscription ends when the producer
+stops, when the producer crashes, or when you cancel the subscription:
 
-- `Permanent` (the default): The consumer stops also, for each stop
+- `Permanent` (the default): the consumer stops too, whatever the
   reason.
-- `Transient`: The consumer stops only if the producer failed. If a
-  source stops correctly with `source.stop()`, the consumer continues.
-- `Temporary`: The consumer continues and removes the subscription.
+- `Transient`: the consumer stops only if the producer crashed. If a
+  source stops normally with `source.stop()`, the consumer keeps going.
+- `Temporary`: the consumer keeps going and forgets the subscription.
 
-You can also cancel a subscription with `sluice.cancel`. Each `on_events`
-callback receives its `Subscription`. Thus a stage can disconnect itself
-while events move.
+You can also cancel a subscription with `sluice.cancel`. Every
+`on_events` callback receives its `Subscription`, so a stage can
+disconnect itself while events are flowing.
 
 ## Process events in parallel
 
-`pool.sink` makes a sink that runs each event in a separate worker
-process, with a limit on the quantity of parallel workers. The demand
-follows the workers: the pool asks for one more event when a worker
-completes. Subscribe it with the `Manual` demand mode; the pool makes its
-own asks. A failure in a worker does not stop the pool:
+`pool.sink` builds a sink that runs each event in its own worker process,
+with a cap on how many workers run at once. Demand follows the workers:
+the pool asks for one more event whenever a worker finishes. Subscribe it
+with the `Manual` demand mode; the pool does its own asking. A crashing
+worker doesn't take the pool down:
 
 ```gleam
 import sluice/pool
@@ -301,11 +347,11 @@ let assert Ok(_) =
   |> sluice.subscribe(consumer: deliveries.data)
 ```
 
-For supervised event workers, use `consumer_supervisor`. It starts one linked
-OTP child for each event. `max_demand` is the maximum number of credited
-children for each subscription. A credit returns only when its child finally
-terminates; an abnormal exit followed by a transient restart keeps the same
-event and credit:
+For supervised event workers, use `consumer_supervisor`. It starts one
+linked OTP child for each event. `max_demand` sets the number of credits
+for each subscription: every running child holds one credit, and the
+credit returns only when the child finally terminates. An abnormal exit
+followed by a transient restart keeps the same event and credit:
 
 ```gleam
 import gleam/erlang/process
@@ -333,35 +379,35 @@ let assert Ok(_) =
   |> sluice.subscribe(consumer: consumer_supervisor.inlet(deliveries.data))
 ```
 
-The child start function must return a process linked to its caller, as normal
-OTP child start functions do. Initialisation is synchronous and must finish
-quickly; the child performs the long-running work after it starts. Children
-are `Temporary` by default. `Transient` children restart only after abnormal
-exits. `Permanent` children are not supported because a successfully completed
-event must not restart.
+The child start function must return a process linked to its caller, as
+normal OTP child start functions do. Initialisation is synchronous and
+must finish quickly; the child does the long-running work after it
+starts. Children are `Temporary` by default. `Transient` children restart
+only after abnormal exits. `Permanent` children are not supported,
+because an event that completed successfully must not restart.
 
 The consumer supervisor owns its demand loop, so it accepts the default
-`Automatic` mode and rejects `Manual` subscriptions. If a producer connection
-ends, existing children continue. The subscription's cancel mode then decides
-whether the consumer supervisor remains alive; when it stops, it shuts down all
-remaining children and kills children that exceed `shutdown_timeout`.
+`Automatic` mode and rejects `Manual` subscriptions. If a producer
+connection ends, the existing children keep running. The subscription's
+cancel mode then decides whether the consumer supervisor stays alive;
+when it stops, it shuts down all remaining children and kills any that
+exceed `shutdown_timeout`.
 
-`pool.sink` remains useful for lightweight best-effort work: its workers are
-unlinked, failures are logged and discarded, and each completion immediately
-asks for one replacement. `consumer_supervisor` provides OTP restart policy,
-restart tolerance, bounded shutdown, and child inspection instead.
+`pool.sink` remains useful for lightweight, best-effort work: its workers
+are unlinked, failures are logged and dropped, and each completion
+immediately asks for a replacement. `consumer_supervisor` gives you OTP
+restart policy, restart tolerance, bounded shutdown, and child inspection
+instead.
 
 ## Yielders and folds
 
-`source.from_yielder` makes a source from a yielder; the source stops
-with the normal reason at the end of the yielder. A source that you
-write yourself must end with `source.emit_final(events)`: the last
-events go out, and then the source stops. Do not wait for a later demand
-to return `source.stop()`: after a batch that does not fill the demand,
-the consumers do not ask again, and the pipeline waits without an end.
-In the other direction,
-`sink.fold` runs the full flow of an outlet through a fold and returns
-the final value:
+`source.from_yielder` builds a source from a yielder; the source stops
+normally when the yielder ends. A source you write yourself must end with
+`source.emit_final(events)`: the last events go out, and then the source
+stops. Don't wait for a later demand to return `source.stop()` — after a
+batch that doesn't fill the demand, the consumers won't ask again, and
+the pipeline waits forever. In the other direction, `sink.fold` runs the
+full flow of an outlet through a fold and returns the final value:
 
 ```gleam
 import gleam/yielder
@@ -374,14 +420,14 @@ let assert Ok(total) =
 
 ## Supervision
 
-Stages start as standard OTP actors. Thus a `static_supervisor` can hold
-them as children. For connections that continue through restarts, give
-names to the stages. Then declare the subscriptions on the builder. The
-stage makes the declared subscriptions during its start. The start fails
-for the checks that the stage can make itself: a dead producer, a
-duplicate, and demand values that are not correct. Then the supervisor
-does the retry. A refusal from the dispatcher of the producer comes later
-as an abnormal end of the subscription:
+Stages start as standard OTP actors, so a `static_supervisor` can hold
+them as children. For connections that survive restarts, give the stages
+names and declare the subscriptions on the builder. The stage then makes
+its declared subscriptions during startup. Startup fails for the checks
+the stage can make itself — a dead producer, a duplicate subscription,
+invalid demand values — and the supervisor retries. A refusal from the
+producer's dispatcher arrives later, as an abnormal end of the
+subscription:
 
 ```gleam
 import gleam/otp/static_supervisor as supervisor
@@ -407,22 +453,22 @@ pub fn start_pipeline() {
 }
 ```
 
-Use `Permanent` subscriptions with `RestForOne`. Then, when a source stops,
-its consumers stop also. The supervisor restarts the subsequent stages in
-the correct sequence. Each stage connects again through the names.
+Use `Permanent` subscriptions with `RestForOne`. When a source stops, its
+consumers stop with it, the supervisor restarts the later stages in
+order, and each stage reconnects through the names.
 
 ## Design notes
 
-- One consumer can hold a maximum of one subscription for each producer. A
-  second `subscribe` call to the same producer returns
+- A consumer can hold at most one subscription per producer. A second
+  `subscribe` call to the same producer returns
   `Error(AlreadySubscribed)`.
-- When a stage stops, the events that move to that stage are lost with its
-  mailbox. The producer acknowledges a cancellation in sequence. Thus a
-  live consumer processes all events that the producer sent before the
+- When a stage stops, the events on their way to it are lost with its
+  mailbox. The producer acknowledges a cancellation in order, so a live
+  consumer processes every event the producer sent before the
   cancellation.
-- One sink can use two sources that have different event types. To do
-  this, make a sum type for the sink. Then put a small gate after each
-  source. Each gate changes the source type to the sum type.
+- One sink can consume from two sources with different event types. To
+  do this, define a sum type for the sink, then put a small gate after
+  each source that wraps the source's type in the sum type.
 
 ## Inspiration
 
