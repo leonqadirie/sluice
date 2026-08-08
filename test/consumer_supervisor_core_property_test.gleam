@@ -15,7 +15,7 @@ type RestartScenario {
   RestartScenario(max_restarts: Int, period_ms: Int, deltas: List(Int))
 }
 
-pub fn demand_replenishment_matches_credit_model_property_test() {
+pub fn demand_replenishment_matches_slot_model_property_test() {
   qcheck.run(property_config(), demand_scenario_generator(), fn(scenario) {
     let DemandScenario(max, min_seed, completions) = scenario
     let min = min_seed % max

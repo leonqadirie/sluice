@@ -348,10 +348,10 @@ let assert Ok(_) =
 ```
 
 For supervised event workers, use `consumer_supervisor`. It starts one
-linked OTP child for each event. `max_demand` sets the number of credits
-for each subscription: every running child holds one credit, and the
-credit returns only when the child finally terminates. An abnormal exit
-followed by a transient restart keeps the same event and credit:
+linked OTP child for each event. `max_demand` sets the number of slots
+for each subscription: every running child occupies one slot, and the
+slot frees up only when the child finally terminates. An abnormal exit
+followed by a transient restart keeps the same event and slot:
 
 ```gleam
 import gleam/erlang/process

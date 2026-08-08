@@ -82,9 +82,10 @@ pub fn released(
   }
 }
 
-/// Return an ask when the occupied credit has reached `min` or less. The
-/// amount restores the account exactly to `max`, including when several
-/// completions were recorded before this function ran.
+/// Return an ask when the count of occupied slots has decreased to `min`
+/// or less. The amount restores the open demand exactly to `max`,
+/// including when several completions were recorded before this function
+/// ran.
 pub fn take_ask(
   core core: Core(subscription),
   subscription subscription: subscription,
