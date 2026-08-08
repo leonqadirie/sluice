@@ -39,7 +39,7 @@ You don't need sluice for a one-off parallel computation over data you
 already have in memory; spawning ordinary processes is simpler. Reach for
 sluice when the stages are long-lived processes and the data never stops.
 
-## Outlets and inlets
+## How do stages connect?
 
 Every connection runs from an **outlet** to an **inlet**. An outlet is
 the face of a stage that provides events. An inlet is the face that
@@ -125,7 +125,7 @@ cd example
 gleam run --module counter_pipeline
 ```
 
-## Demand
+## Who sets the pace?
 
 When an inlet subscribes to an outlet, the consumer immediately asks for
 `max_demand` events. Delivered events reach the `on_events` callback in
@@ -331,7 +331,7 @@ let assert Ok(prices) =
   |> source.start()
 ```
 
-## When stages stop
+## What happens when a stage stops?
 
 Every subscription has a cancel mode, which tells the consumer stage what
 to do when the subscription ends. A subscription ends when the producer
