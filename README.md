@@ -10,8 +10,7 @@ branch and merge into a graph. There are three kinds of stages:
 
 - A **Source** produces events.
 - A **Gate** receives events, transforms them, and passes them on. A gate
-  can emit zero, one, or many events for each event it receives, so gates
-  can also filter, expand, and aggregate.
+  can emit 0-n events for each event it receives.
 - A **Sink** consumes events.
 
 Events flow forward through the pipeline. Demand flows backward:
