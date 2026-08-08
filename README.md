@@ -21,9 +21,11 @@ to a sink of `String`, you get a compile error.
 
 ## Quick start
 
+<!-- x-release-please-start-major -->
 ```sh
-gleam add sluice
+gleam add sluice@0
 ```
+<!-- x-release-please-end -->
 
 ```gleam
 import gleam/erlang/process

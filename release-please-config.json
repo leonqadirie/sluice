@@ -10,6 +10,10 @@
         {
           "type": "generic",
           "path": "gleam.toml"
+        },
+        {
+          "type": "generic",
+          "path": "README.md"
         }
       ]
     }
