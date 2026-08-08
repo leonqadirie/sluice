@@ -5,8 +5,22 @@
 
 Stage pipelines for Gleam, with demand control and backpressure.
 
-A pipeline is a chain of stages that events flow through; stages can also
-branch and merge into a graph. There are three kinds of stages:
+Sluice moves events through a chain of long-lived processes, at the
+pace the consumers set. You write what each stage does; sluice handles
+the repetitive part:
+
+- It delivers events from stage to stage in batches.
+- It asks each producer for only as many events as its consumers can
+  handle, so a fast producer never floods a slow consumer's mailbox.
+- It buffers events that were produced before any consumer asked for them,
+  and it logs a warning before it ever drops one.
+- It routes events to many subscribers: split the work between them,
+  copy every event to all of them, or partition by key.
+- It runs events in parallel worker processes when you ask for that.
+- It reconnects the pipeline when a supervisor restarts a stage.
+
+You build a pipeline from three kinds of stages; stages can also branch
+and merge into a graph:
 
 - A **Source** produces events.
 - A **Gate** receives events, transforms them, and passes them on. A gate
@@ -20,10 +34,7 @@ events:   Source ──▶ Gate ──▶ Sink
 demand:   Source ◀── Gate ◀── Sink
 ```
 
-Nothing moves until the consuming side asks for events. Because of this,
-a slow sink is never overwhelmed: backpressure spreads to the stages
-before it and mailboxes stay bounded. No event is dropped silently:
-a stage that must drop events logs a warning first.
+Nothing moves until the consuming side asks for events.
 
 ## When to use sluice
 
